@@ -32,4 +32,5 @@ jobs:
       - name: Update Notion stock prices
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_READER_TOKEN: ${{ secrets.NOTION_READER_TOKEN }}
         run: python stock_price_updater.py
