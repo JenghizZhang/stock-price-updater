@@ -3,9 +3,6 @@ name: Update Stock Prices
 on:
   workflow_dispatch:
 
-  schedule:
-    - cron: "2/5 * * * *"
-
 permissions:
   contents: read
 
