@@ -1,12 +1,10 @@
 name: Update Stock Prices
 
 on:
-  # 仍然允许你手动运行
   workflow_dispatch:
 
-  # 每天、全天、每 5 分钟运行
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2/5 * * * *"
 
 permissions:
   contents: read
