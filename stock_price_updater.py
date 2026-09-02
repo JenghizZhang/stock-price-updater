@@ -17,9 +17,6 @@ NOTION_HEADERS = {
 
 
 def find_stock_data_source():
-    """
-    Find the Stocks Price data source shared with this Notion connection.
-    """
     url = "https://api.notion.com/v1/search"
 
     payload = {
@@ -51,9 +48,6 @@ def find_stock_data_source():
 
 
 def get_stock_rows(data_source_id):
-    """
-    Read all rows from Stocks Price.
-    """
     url = (
         f"https://api.notion.com/v1/data_sources/"
         f"{data_source_id}/query"
@@ -71,9 +65,6 @@ def get_stock_rows(data_source_id):
 
 
 def get_ticker(page):
-    """
-    Read ticker from Notion row.
-    """
     title_items = page["properties"]["Ticker"]["title"]
 
     if not title_items:
@@ -85,23 +76,61 @@ def get_ticker(page):
     ).strip().upper()
 
 
+def verify_missing_ticker(ticker):
+    """
+    Returns:
+        0.0  -> ticker appears invalid / no market data exists
+        None -> temporary Yahoo/network failure; do not update Notion
+        price -> valid ticker and price found
+    """
+
+    try:
+        stock = yf.Ticker(ticker)
+
+        history = stock.history(
+            period="5d",
+            interval="1d",
+            auto_adjust=False
+        )
+
+        if history is None or history.empty:
+            print(f"{ticker}: no market data found -> treating as invalid")
+            return 0.0
+
+        close = history["Close"].dropna()
+
+        if close.empty:
+            print(f"{ticker}: no valid closing price -> treating as invalid")
+            return 0.0
+
+        price = float(close.iloc[-1])
+
+        if price <= 0:
+            return 0.0
+
+        print(f"{ticker}: verification succeeded -> ${price:.2f}")
+        return price
+
+    except Exception as exc:
+        print(
+            f"{ticker}: verification request failed ({exc}) "
+            f"-> keep previous Notion price"
+        )
+        return None
+
+
 def get_prices(tickers):
     """
-    Get latest available price.
-
-    Valid ticker:
-        latest price
-
-    Invalid ticker / no data:
-        0
+    Returns:
+        ticker: positive number -> update price
+        ticker: 0.0             -> invalid ticker
+        ticker: None            -> temporary failure, do not update
     """
 
     print(f"Downloading prices for: {', '.join(tickers)}")
 
-    # Default every ticker to 0.
-    # If Yahoo returns a valid price, it will overwrite 0.
     prices = {
-        ticker: 0.0
+        ticker: None
         for ticker in tickers
     }
 
@@ -117,46 +146,45 @@ def get_prices(tickers):
             threads=True,
         )
 
-        for ticker in tickers:
-            try:
-                close = data[ticker]["Close"].dropna()
-
-                if not close.empty:
-                    price = float(close.iloc[-1])
-
-                    if price > 0:
-                        prices[ticker] = price
-                        print(
-                            f"{ticker}: ${price:.2f}"
-                        )
-                    else:
-                        print(
-                            f"{ticker}: invalid price -> 0"
-                        )
-
-                else:
-                    print(
-                        f"{ticker}: no price data -> 0"
-                    )
-
-            except Exception as exc:
-                print(
-                    f"{ticker}: failed to read price "
-                    f"({exc}) -> 0"
-                )
-
     except Exception as exc:
+        # Important:
+        # If the whole Yahoo request fails, DO NOT set everything to 0.
         print(
-            f"Yahoo Finance request failed: {exc}"
+            f"Yahoo Finance batch request failed: {exc}"
         )
+        print(
+            "Keeping all previous Notion prices."
+        )
+        return prices
+
+    for ticker in tickers:
+
+        try:
+            close = data[ticker]["Close"].dropna()
+
+            if not close.empty:
+                price = float(close.iloc[-1])
+
+                if price > 0:
+                    prices[ticker] = price
+                    print(f"{ticker}: ${price:.2f}")
+                    continue
+
+        except Exception:
+            pass
+
+        # Batch download did not return a usable price.
+        # Check this ticker one more time separately.
+        print(
+            f"{ticker}: missing from batch response, verifying..."
+        )
+
+        prices[ticker] = verify_missing_ticker(ticker)
 
     return prices
 
 
 def update_notion_page(page_id, ticker, price):
-    """
-    Update only Current Price and Last Updated.
-    """
     now = datetime.now(
         ZoneInfo("America/Los_Angeles")
     ).isoformat()
@@ -185,13 +213,9 @@ def update_notion_page(page_id, ticker, price):
     response.raise_for_status()
 
     if price == 0:
-        print(
-            f"Updated {ticker}: INVALID / NO DATA -> $0"
-        )
+        print(f"Updated {ticker}: INVALID TICKER -> $0")
     else:
-        print(
-            f"Updated {ticker}: ${price:.2f}"
-        )
+        print(f"Updated {ticker}: ${price:.2f}")
 
 
 def main():
@@ -217,7 +241,17 @@ def main():
     )
 
     for ticker, page_id in ticker_pages.items():
-        price = prices.get(ticker, 0.0)
+
+        price = prices.get(ticker)
+
+        # Temporary Yahoo/network failure:
+        # keep existing Notion price untouched.
+        if price is None:
+            print(
+                f"Skipping {ticker}: temporary data failure. "
+                f"Previous Notion price preserved."
+            )
+            continue
 
         update_notion_page(
             page_id=page_id,
