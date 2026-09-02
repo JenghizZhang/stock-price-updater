@@ -18,7 +18,7 @@ NOTION_HEADERS = {
 
 def find_stock_data_source():
     """
-    Find the only Stocks Price data source shared with this Notion connection.
+    Find the Stocks Price data source shared with this Notion connection.
     """
     url = "https://api.notion.com/v1/search"
 
@@ -43,8 +43,7 @@ def find_stock_data_source():
 
     if not results:
         raise RuntimeError(
-            "Cannot find the Stocks Price data source. "
-            "Make sure Stock Price Updater is connected to it."
+            "Cannot find the Stocks Price data source."
         )
 
     print(f"Found Notion data source: {results[0]['id']}")
@@ -72,6 +71,9 @@ def get_stock_rows(data_source_id):
 
 
 def get_ticker(page):
+    """
+    Read ticker from Notion row.
+    """
     title_items = page["properties"]["Ticker"]["title"]
 
     if not title_items:
@@ -85,32 +87,68 @@ def get_ticker(page):
 
 def get_prices(tickers):
     """
-    Download latest available prices for all tickers in one batch.
-    Includes extended-hours data when available.
+    Get latest available price.
+
+    Valid ticker:
+        latest price
+
+    Invalid ticker / no data:
+        0
     """
+
     print(f"Downloading prices for: {', '.join(tickers)}")
 
-    data = yf.download(
-        tickers=tickers,
-        period="1d",
-        interval="1m",
-        group_by="ticker",
-        auto_adjust=False,
-        prepost=True,
-        progress=False,
-        threads=True,
-    )
+    # Default every ticker to 0.
+    # If Yahoo returns a valid price, it will overwrite 0.
+    prices = {
+        ticker: 0.0
+        for ticker in tickers
+    }
 
-    prices = {}
+    try:
+        data = yf.download(
+            tickers=tickers,
+            period="5d",
+            interval="1m",
+            group_by="ticker",
+            auto_adjust=False,
+            prepost=True,
+            progress=False,
+            threads=True,
+        )
 
-    for ticker in tickers:
-        try:
-            close = data[ticker]["Close"].dropna()
+        for ticker in tickers:
+            try:
+                close = data[ticker]["Close"].dropna()
 
-            if not close.empty:
-                prices[ticker] = float(close.iloc[-1])
-        except Exception as exc:
-            print(f"Could not get {ticker}: {exc}")
+                if not close.empty:
+                    price = float(close.iloc[-1])
+
+                    if price > 0:
+                        prices[ticker] = price
+                        print(
+                            f"{ticker}: ${price:.2f}"
+                        )
+                    else:
+                        print(
+                            f"{ticker}: invalid price -> 0"
+                        )
+
+                else:
+                    print(
+                        f"{ticker}: no price data -> 0"
+                    )
+
+            except Exception as exc:
+                print(
+                    f"{ticker}: failed to read price "
+                    f"({exc}) -> 0"
+                )
+
+    except Exception as exc:
+        print(
+            f"Yahoo Finance request failed: {exc}"
+        )
 
     return prices
 
@@ -146,7 +184,14 @@ def update_notion_page(page_id, ticker, price):
     )
     response.raise_for_status()
 
-    print(f"Updated {ticker}: ${price:.2f}")
+    if price == 0:
+        print(
+            f"Updated {ticker}: INVALID / NO DATA -> $0"
+        )
+    else:
+        print(
+            f"Updated {ticker}: ${price:.2f}"
+        )
 
 
 def main():
@@ -163,16 +208,16 @@ def main():
             ticker_pages[ticker] = page["id"]
 
     if not ticker_pages:
-        raise RuntimeError("No tickers found in Stocks Price.")
+        raise RuntimeError(
+            "No tickers found in Stocks Price."
+        )
 
-    prices = get_prices(list(ticker_pages.keys()))
+    prices = get_prices(
+        list(ticker_pages.keys())
+    )
 
     for ticker, page_id in ticker_pages.items():
-        price = prices.get(ticker)
-
-        if price is None:
-            print(f"Skipping {ticker}: no price returned.")
-            continue
+        price = prices.get(ticker, 0.0)
 
         update_notion_page(
             page_id=page_id,
