@@ -16,6 +16,25 @@ NOTION_READER_TOKEN = os.environ["NOTION_READER_TOKEN"]
 
 NOTION_VERSION = "2026-03-11"
 
+# Optional.
+#
+# Normally you do NOT need to set these.
+# The program first tries to identify the owner of
+# Stock Alert Reader automatically.
+#
+# If your Notion workspace has several users and automatic
+# detection does not work, you can set one of these later.
+NOTION_NOTIFY_USER_ID = os.environ.get(
+    "NOTION_NOTIFY_USER_ID",
+    "",
+).strip()
+
+NOTION_NOTIFY_USER_NAME = os.environ.get(
+    "NOTION_NOTIFY_USER_NAME",
+    "",
+).strip()
+
+
 # Stocks Price database:
 # Read + Update
 WRITER_HEADERS = {
@@ -24,8 +43,13 @@ WRITER_HEADERS = {
     "Content-Type": "application/json",
 }
 
+
 # 股票 page:
-# Read content + Insert comments
+#
+# Read content
+# Read comments
+# Insert comments
+# Read user information without email
 READER_HEADERS = {
     "Authorization": f"Bearer {NOTION_READER_TOKEN}",
     "Notion-Version": NOTION_VERSION,
@@ -39,7 +63,7 @@ READER_HEADERS = {
 
 def find_stock_data_source():
     """
-    Find the Stocks Price data source.
+    Find Stocks Price data source.
     """
 
     url = "https://api.notion.com/v1/search"
@@ -122,7 +146,7 @@ def get_stock_rows(data_source_id):
 
 def get_ticker(page):
     """
-    Read ticker symbol from Stocks Price.
+    Read Ticker.
     """
 
     title_items = (
@@ -159,21 +183,20 @@ def get_last_alert_range(page):
     )
 
     return "".join(
-        item.get("plain_text", "")
+        item.get(
+            "plain_text",
+            ""
+        )
         for item in items
     ).strip()
 
 
 def get_current_price(page):
     """
-    Read the Current Price already stored in Notion.
+    Read the Current Price currently stored in Notion.
 
-    IMPORTANT:
-    This function is called BEFORE the newest price
-    is written to Notion.
-
-    Therefore this value represents the price from
-    the previous program run.
+    Because this happens BEFORE we update the price,
+    this is the previous program run's price.
     """
 
     prop = (
@@ -194,7 +217,10 @@ def get_current_price(page):
     try:
         return float(value)
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
         return None
 
 
@@ -204,20 +230,17 @@ def get_current_price(page):
 
 def verify_missing_ticker(ticker):
     """
-    If batch download doesn't return a price,
-    verify ticker individually.
-
     Returns:
 
         > 0
-            Valid ticker / price
+            valid ticker / valid price
 
         0
-            Invalid ticker
+            invalid ticker
 
         None
-            Temporary Yahoo/network issue.
-            Preserve existing Notion price.
+            temporary failure
+            preserve previous Notion value
     """
 
     try:
@@ -284,7 +307,7 @@ def verify_missing_ticker(ticker):
 
 def get_prices(tickers):
     """
-    Download latest prices.
+    Download latest market prices.
     """
 
     print(
@@ -431,7 +454,7 @@ def update_notion_price(
 
 def extract_page_title(page):
     """
-    Extract title from Notion page.
+    Extract page title.
     """
 
     for prop in (
@@ -515,7 +538,7 @@ def find_stock_notes_page():
 
 def get_block_text(block):
     """
-    Extract plain text from a Notion block.
+    Extract plain text from a block.
     """
 
     block_type = block.get(
@@ -592,6 +615,344 @@ def get_block_children(block_id):
 
 
 # =========================================================
+# Notion user / @mention
+# =========================================================
+
+def get_connection_owner_user_id():
+    """
+    Try to get the human user who owns this
+    Notion connection.
+
+    For an internal integration, the bot object may
+    contain its owner.
+
+    Returns:
+        user_id
+        or None
+    """
+
+    url = (
+        "https://api.notion.com/v1/users/me"
+    )
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=READER_HEADERS,
+            timeout=30,
+        )
+
+        if not response.ok:
+
+            print(
+                "Could not retrieve connection owner: "
+                f"HTTP {response.status_code}"
+            )
+
+            return None
+
+        data = response.json()
+
+        # Some authentication types may directly
+        # represent a person.
+        if data.get("type") == "person":
+
+            user_id = data.get(
+                "id"
+            )
+
+            if user_id:
+
+                print(
+                    "Notification user detected "
+                    "from token user."
+                )
+
+                return user_id
+
+        # Internal integration bot.
+        if data.get("type") == "bot":
+
+            bot = data.get(
+                "bot",
+                {},
+            )
+
+            owner = bot.get(
+                "owner",
+                {},
+            )
+
+            if owner.get("type") == "user":
+
+                user = owner.get(
+                    "user",
+                    {},
+                )
+
+                user_id = user.get(
+                    "id"
+                )
+
+                if user_id:
+
+                    print(
+                        "Notification user detected "
+                        "from connection owner."
+                    )
+
+                    return user_id
+
+    except Exception as exc:
+
+        print(
+            "Connection owner detection failed: "
+            f"{exc}"
+        )
+
+    return None
+
+
+def get_notion_users():
+    """
+    List human users in the workspace.
+
+    Requires:
+        Read user information
+        without email addresses
+    """
+
+    url = (
+        "https://api.notion.com/v1/users"
+    )
+
+    users = []
+
+    cursor = None
+
+    while True:
+
+        params = {
+            "page_size": 100
+        }
+
+        if cursor:
+
+            params[
+                "start_cursor"
+            ] = cursor
+
+        response = requests.get(
+            url,
+            headers=READER_HEADERS,
+            params=params,
+            timeout=30,
+        )
+
+        if not response.ok:
+
+            print(
+                "Unable to list Notion users."
+            )
+
+            print(
+                f"HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+
+            return []
+
+        data = response.json()
+
+        for user in data.get(
+            "results",
+            [],
+        ):
+
+            if user.get("type") == "person":
+
+                users.append(
+                    user
+                )
+
+        if not data.get(
+            "has_more"
+        ):
+            break
+
+        cursor = data.get(
+            "next_cursor"
+        )
+
+    return users
+
+
+def resolve_notification_user_id():
+    """
+    Determine which Notion user should be @mentioned.
+
+    Priority:
+
+    1. NOTION_NOTIFY_USER_ID environment variable
+
+    2. Connection owner
+
+    3. NOTION_NOTIFY_USER_NAME environment variable
+
+    4. If there is exactly one human user in the
+       workspace, use that user automatically.
+
+    Returns:
+        user_id
+
+    or:
+        None
+    """
+
+    # -----------------------------------------------------
+    # Explicit user ID
+    # -----------------------------------------------------
+
+    if NOTION_NOTIFY_USER_ID:
+
+        print(
+            "Using NOTION_NOTIFY_USER_ID."
+        )
+
+        return (
+            NOTION_NOTIFY_USER_ID
+        )
+
+    # -----------------------------------------------------
+    # Connection owner
+    # -----------------------------------------------------
+
+    owner_user_id = (
+        get_connection_owner_user_id()
+    )
+
+    if owner_user_id:
+
+        return owner_user_id
+
+    # -----------------------------------------------------
+    # List human users
+    # -----------------------------------------------------
+
+    users = (
+        get_notion_users()
+    )
+
+    if not users:
+
+        print(
+            "ERROR: No Notion person users "
+            "could be found."
+        )
+
+        return None
+
+    # -----------------------------------------------------
+    # Explicit name
+    # -----------------------------------------------------
+
+    if NOTION_NOTIFY_USER_NAME:
+
+        wanted_name = (
+            NOTION_NOTIFY_USER_NAME
+            .casefold()
+        )
+
+        matches = [
+            user
+            for user in users
+            if (
+                user.get(
+                    "name",
+                    ""
+                )
+                .strip()
+                .casefold()
+                == wanted_name
+            )
+        ]
+
+        if len(matches) == 1:
+
+            print(
+                "Notification user found: "
+                f"{matches[0].get('name')}"
+            )
+
+            return matches[0]["id"]
+
+        if len(matches) > 1:
+
+            print(
+                "ERROR: More than one Notion "
+                "user has this name."
+            )
+
+            return None
+
+        print(
+            "ERROR: NOTION_NOTIFY_USER_NAME "
+            f"'{NOTION_NOTIFY_USER_NAME}' "
+            "was not found."
+        )
+
+    # -----------------------------------------------------
+    # Exactly one human user
+    # -----------------------------------------------------
+
+    if len(users) == 1:
+
+        user = users[0]
+
+        print(
+            "Only one human Notion user found."
+        )
+
+        print(
+            "Notification user: "
+            f"{user.get('name', '(unknown)')}"
+        )
+
+        return user["id"]
+
+    # -----------------------------------------------------
+    # Ambiguous
+    # -----------------------------------------------------
+
+    print("")
+    print(
+        "Could not automatically determine "
+        "which Notion user to @mention."
+    )
+
+    print(
+        "Available Notion users:"
+    )
+
+    for user in users:
+
+        print(
+            f"  - "
+            f"{user.get('name', '(unknown)')} "
+            f"| {user.get('id')}"
+        )
+
+    print("")
+    print(
+        "Set NOTION_NOTIFY_USER_NAME "
+        "or NOTION_NOTIFY_USER_ID."
+    )
+
+    return None
+
+
+# =========================================================
 # Alert parsing
 # =========================================================
 
@@ -606,10 +967,8 @@ ALERT_PATTERN = re.compile(
 
 def format_number(value):
     """
-    Examples:
-
-        702.0 -> 702
-        96.4 -> 96.4
+    702.0 -> 702
+    96.4  -> 96.4
     """
 
     if float(value).is_integer():
@@ -641,15 +1000,15 @@ def parse_alert_line(text):
     """
     Example:
 
-        @alert 702-724（强）破位走弱 激进
+        @alert 704-724（强）破位走弱 激进
 
-    Result:
+    becomes:
 
-        low = 702
+        low = 704
         high = 724
-        range = 702-724
+
         display_text =
-            702-724（强）破位走弱 激进
+        704-724（强）破位走弱 激进
     """
 
     match = ALERT_PATTERN.search(
@@ -703,7 +1062,7 @@ def ticker_matches_heading(
     valid_tickers,
 ):
     """
-    Examples:
+    Supports:
 
         SPY
         SPY（*）
@@ -711,13 +1070,15 @@ def ticker_matches_heading(
         SPY重要
         SPY重要SPY（*）
 
-    All resolve to SPY.
+    Repeated same ticker is fine.
 
-    If two different tickers appear,
-    skip the heading.
+    Two different tickers in one heading:
+    ambiguous -> skip.
     """
 
-    upper_text = text.upper()
+    upper_text = (
+        text.upper()
+    )
 
     matches = set()
 
@@ -755,7 +1116,7 @@ def ticker_matches_heading(
 
 
 # =========================================================
-# Collect Alerts + ticker heading IDs
+# Collect @alert + ticker heading IDs
 # =========================================================
 
 def collect_alerts_from_page(
@@ -765,13 +1126,16 @@ def collect_alerts_from_page(
     """
     Parse 股票 page by ticker section.
 
-    @alert can be:
-        - separate paragraphs
-        - multiple lines in one paragraph
-        - inside toggles
-        - separated by normal notes
-        - separated by embeds / images
-        - nested
+    @alert may be:
+
+        separate paragraphs
+        multiple lines in one paragraph
+        inside toggles
+        mixed with normal notes
+        separated by images / embeds
+        deeply nested
+
+    Everything except @alert is ignored.
 
     Returns:
 
@@ -793,13 +1157,19 @@ def collect_alerts_from_page(
         "toggle",
     }
 
+    # -----------------------------------------------------
+    # Scan one block recursively
+    # -----------------------------------------------------
+
     def extract_alerts_from_block(
         block,
         ticker,
     ):
 
-        text = get_block_text(
-            block
+        text = (
+            get_block_text(
+                block
+            )
         )
 
         if text:
@@ -864,7 +1234,7 @@ def collect_alerts_from_page(
                 )
 
     # -----------------------------------------------------
-    # Top-level 股票 blocks
+    # Top-level blocks
     # -----------------------------------------------------
 
     top_blocks = (
@@ -877,18 +1247,23 @@ def collect_alerts_from_page(
 
     for block in top_blocks:
 
-        text = get_block_text(
-            block
+        text = (
+            get_block_text(
+                block
+            )
         )
 
-        block_type = block.get(
-            "type"
+        block_type = (
+            block.get(
+                "type"
+            )
         )
 
         detected = None
 
         if (
-            block_type in heading_types
+            block_type
+            in heading_types
             and text
         ):
 
@@ -899,11 +1274,14 @@ def collect_alerts_from_page(
                 )
             )
 
+        # -------------------------------------------------
+        # New ticker section
+        # -------------------------------------------------
+
         if detected:
 
             current_ticker = detected
 
-            # Save exact heading/toggle block.
             ticker_heading_ids[
                 detected
             ] = block["id"]
@@ -937,6 +1315,10 @@ def collect_alerts_from_page(
 
             continue
 
+        # -------------------------------------------------
+        # Ordinary blocks after ticker heading
+        # -------------------------------------------------
+
         if current_ticker:
 
             extract_alerts_from_block(
@@ -945,8 +1327,7 @@ def collect_alerts_from_page(
             )
 
     # -----------------------------------------------------
-    # Remove duplicate numeric ranges.
-    # Preserve original Notion order.
+    # Deduplicate numeric ranges
     # -----------------------------------------------------
 
     cleaned = {}
@@ -991,7 +1372,7 @@ def collect_alerts_from_page(
 
 
 # =========================================================
-# Alert state
+# Alert state logic
 # =========================================================
 
 def determine_alert_state(
@@ -1001,11 +1382,11 @@ def determine_alert_state(
     """
     Possible states:
 
-        RANGE:702-724
+        RANGE:704-724
 
-        GAP:687-697|702-724
+        GAP:687-697|704-724
 
-        ABOVE:702-724
+        ABOVE:704-724
 
         BELOW:588-613
     """
@@ -1143,20 +1524,15 @@ def get_price_movement(
     current_price,
 ):
     """
-    Determine price direction based on the price
-    saved during the previous program run.
+    Determine UP / DOWN based on previous program run.
 
     Example:
 
-        previous = 703.82
-        current  = 709.55
+        703.82 -> 709.55
+        = UP
 
-        -> UP
-
-        previous = 725.30
-        current  = 719.80
-
-        -> DOWN
+        725.30 -> 719.80
+        = DOWN
     """
 
     if (
@@ -1209,9 +1585,9 @@ def get_price_movement(
 
 def build_alert_list_text(alerts):
     """
-    Preserve the original Notion order.
+    Preserve Notion order.
 
-    Remove @alert from the displayed notification.
+    @alert itself is hidden from notification.
     """
 
     return "\n".join(
@@ -1251,11 +1627,13 @@ def build_alert_message(
     )
 
     old_price = (
-        movement["previous_price"]
+        movement[
+            "previous_price"
+        ]
     )
 
     # -----------------------------------------------------
-    # Price movement text
+    # Price movement
     # -----------------------------------------------------
 
     if direction == "UP":
@@ -1276,11 +1654,8 @@ def build_alert_message(
 
     else:
 
-        # Price did not change to 2 decimals,
-        # or previous price is unavailable.
-        #
-        # This is also useful when the alert is caused
-        # by manually changing the @alert ranges.
+        # Useful when @alert configuration changed
+        # while price remained unchanged.
         price_description = (
             f"{ticker} 价格为 "
             f"{price_text}"
@@ -1383,7 +1758,7 @@ def build_alert_message(
 
 
 # =========================================================
-# Notion Comment
+# Notion Comment helper
 # =========================================================
 
 def split_text_for_notion(
@@ -1391,9 +1766,9 @@ def split_text_for_notion(
     chunk_size=1800,
 ):
     """
-    Split long alert messages into multiple
-    rich_text objects while keeping them inside
-    ONE Notion comment.
+    Split long message into multiple rich_text objects.
+
+    One alert still remains ONE Notion comment.
     """
 
     chunks = []
@@ -1429,11 +1804,15 @@ def split_text_for_notion(
             split_at += 1
 
         chunks.append(
-            remaining[:split_at]
+            remaining[
+                :split_at
+            ]
         )
 
         remaining = (
-            remaining[split_at:]
+            remaining[
+                split_at:
+            ]
         )
 
     return chunks
@@ -1443,13 +1822,32 @@ def send_notion_alert_comment(
     block_id,
     ticker,
     message,
+    notify_user_id,
 ):
     """
-    Create a new Notion comment attached directly
-    to the ticker heading / toggle block.
+    Create a comment on the stock heading.
 
-    Returns True only when Notion confirms success.
+    IMPORTANT:
+
+    The first rich_text object is a REAL
+    Notion user mention.
+
+    It is NOT plain text such as:
+
+        @User
+
+    This is what allows Notion to treat the
+    alert as a true @mention.
     """
+
+    if not notify_user_id:
+
+        print(
+            f"{ticker}: notification user "
+            f"ID is missing."
+        )
+
+        return False
 
     url = (
         "https://api.notion.com/v1/comments"
@@ -1461,14 +1859,48 @@ def send_notion_alert_comment(
         )
     )
 
-    if len(chunks) > 100:
+    # 1 mention
+    # 1 newline text
+    # + message chunks
+    if (
+        len(chunks) + 2
+        > 100
+    ):
 
-        raise RuntimeError(
+        print(
             f"{ticker}: alert message is "
-            f"too long for one Notion comment."
+            f"too long for one comment."
         )
 
-    rich_text = []
+        return False
+
+    # =====================================================
+    # REAL @MENTION
+    # =====================================================
+
+    rich_text = [
+        {
+            "type": "mention",
+            "mention": {
+                "type": "user",
+                "user": {
+                    "object": "user",
+                    "id": notify_user_id,
+                },
+            },
+        },
+
+        {
+            "type": "text",
+            "text": {
+                "content": "\n\n"
+            },
+        },
+    ]
+
+    # =====================================================
+    # Alert body
+    # =====================================================
 
     for chunk in chunks:
 
@@ -1489,8 +1921,8 @@ def send_notion_alert_comment(
     }
 
     print(
-        f"{ticker}: sending Notion comment "
-        f"to heading block {block_id}..."
+        f"{ticker}: sending Notion "
+        f"@mention comment..."
     )
 
     response = requests.post(
@@ -1517,12 +1949,12 @@ def send_notion_alert_comment(
 
     comment_id = data.get(
         "id",
-        "(unknown)"
+        "(unknown)",
     )
 
     print(
-        f"{ticker}: Notion alert comment "
-        f"created successfully."
+        f"{ticker}: Notion @mention "
+        f"comment created successfully."
     )
 
     print(
@@ -1534,7 +1966,7 @@ def send_notion_alert_comment(
 
 
 # =========================================================
-# Legacy Last Alert Range migration
+# Legacy state migration
 # =========================================================
 
 def legacy_state_matches(
@@ -1542,7 +1974,7 @@ def legacy_state_matches(
     new_state,
 ):
     """
-    Prevent fake alerts when upgrading old state format.
+    Prevent fake alerts when upgrading old format.
 
     Old:
 
@@ -1564,7 +1996,9 @@ def legacy_state_matches(
 
         return False
 
-    kind = new_state["kind"]
+    kind = (
+        new_state["kind"]
+    )
 
     if kind == "RANGE":
 
@@ -1620,7 +2054,7 @@ def update_last_alert_range(
     new_state,
 ):
     """
-    Save internal alert state to Stocks Price.
+    Save internal alert state.
     """
 
     rich_text = []
@@ -1679,32 +2113,46 @@ def process_alert_states(
     ticker_heading_ids,
 ):
     """
-    Alert rules:
+    Rules:
 
-    1. First initialization:
-       Save state only.
-       No notification.
+    First initialization:
+        Save state only.
+        No notification.
 
-    2. Same state:
-       No notification.
+    Same state:
+        No notification.
 
-    3. State changed:
-       Build message.
-       Send Notion comment.
-       Update Last Alert Range ONLY after
-       the comment succeeds.
+    State changed:
 
-    4. If comment fails:
-       Do not update Last Alert Range.
-       Next run retries automatically.
+        Build alert
+            ↓
+        Resolve notification user
+            ↓
+        Send comment with REAL @mention
+            ↓
+        Comment succeeds
+            ↓
+        Update Last Alert Range
+
+    Comment fails:
+
+        DO NOT update state
+            ↓
+        Next minute retries
     """
+
+    notify_user_id = None
+
+    notification_user_checked = False
 
     for ticker, alerts in (
         alerts_by_ticker.items()
     ):
 
-        info = ticker_info.get(
-            ticker
+        info = (
+            ticker_info.get(
+                ticker
+            )
         )
 
         if not info:
@@ -1716,12 +2164,14 @@ def process_alert_states(
 
             continue
 
-        price = prices.get(
-            ticker
+        price = (
+            prices.get(
+                ticker
+            )
         )
 
         # -------------------------------------------------
-        # Missing / invalid price
+        # Invalid / missing price
         # -------------------------------------------------
 
         if (
@@ -1779,9 +2229,11 @@ def process_alert_states(
 
         print(
             f"{ticker}: "
-            f"previous_price={previous_price_text}, "
+            f"previous_price="
+            f"{previous_price_text}, "
             f"price={price:.2f}, "
-            f"old={old_state or '(empty)'}, "
+            f"old="
+            f"{old_state or '(empty)'}, "
             f"new={new_state}"
         )
 
@@ -1806,7 +2258,7 @@ def process_alert_states(
             continue
 
         # =================================================
-        # MIGRATE OLD STATE
+        # OLD FORMAT MIGRATION
         # =================================================
 
         if legacy_state_matches(
@@ -1861,16 +2313,12 @@ def process_alert_states(
         print("=" * 70)
         print("ALERT")
         print("=" * 70)
-
-        print(
-            message
-        )
-
+        print(message)
         print("=" * 70)
         print("")
 
         # -------------------------------------------------
-        # Find ticker heading
+        # Find stock heading
         # -------------------------------------------------
 
         heading_block_id = (
@@ -1883,7 +2331,7 @@ def process_alert_states(
 
             print(
                 f"{ticker}: ERROR - "
-                f"ticker heading block ID "
+                f"ticker heading block "
                 f"not found."
             )
 
@@ -1892,14 +2340,44 @@ def process_alert_states(
                 f"will NOT be updated."
             )
 
-            print(
-                f"{ticker}: next run will retry."
-            )
-
             continue
 
         # -------------------------------------------------
-        # Send notification FIRST
+        # Resolve user only when an alert actually occurs.
+        #
+        # No reason to call /users every minute when
+        # there are no new alerts.
+        # -------------------------------------------------
+
+        if not notification_user_checked:
+
+            notify_user_id = (
+                resolve_notification_user_id()
+            )
+
+            notification_user_checked = (
+                True
+            )
+
+        if not notify_user_id:
+
+            print(
+                f"{ticker}: ERROR - "
+                f"notification user could "
+                f"not be determined."
+            )
+
+            print(
+                f"{ticker}: alert will retry "
+                f"next run."
+            )
+
+            # IMPORTANT:
+            # Do not update state.
+            continue
+
+        # -------------------------------------------------
+        # Send comment FIRST
         # -------------------------------------------------
 
         comment_success = (
@@ -1907,6 +2385,9 @@ def process_alert_states(
                 block_id=heading_block_id,
                 ticker=ticker,
                 message=message,
+                notify_user_id=(
+                    notify_user_id
+                ),
             )
         )
 
@@ -1925,14 +2406,15 @@ def process_alert_states(
 
             print(
                 f"{ticker}: will retry "
-                f"on the next run."
+                f"next run."
             )
 
             continue
 
         # -------------------------------------------------
-        # Comment succeeded.
-        # Now update state.
+        # Comment + @mention succeeded.
+        #
+        # NOW save state.
         # -------------------------------------------------
 
         update_last_alert_range(
@@ -1952,10 +2434,11 @@ def main():
     # 1. Read Stocks Price
     #
     # IMPORTANT:
-    # This happens BEFORE we update Current Price.
     #
-    # Therefore get_current_price() gives us
-    # the PREVIOUS run's price.
+    # Current Price is read here BEFORE we overwrite it.
+    #
+    # Therefore previous_price represents the previous
+    # program run.
     # -----------------------------------------------------
 
     data_source_id = (
@@ -1984,6 +2467,7 @@ def main():
         ticker_info[
             ticker
         ] = {
+
             "page_id": (
                 page["id"]
             ),
@@ -1994,9 +2478,6 @@ def main():
                 )
             ),
 
-            # IMPORTANT:
-            # Save old Current Price before
-            # overwriting it below.
             "previous_price": (
                 get_current_price(
                     page
@@ -2016,7 +2497,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # 2. Download latest market prices
+    # 2. Download latest prices
     # -----------------------------------------------------
 
     prices = (
@@ -2028,14 +2509,15 @@ def main():
     # -----------------------------------------------------
     # 3. Update Stocks Price
     #
-    # previous_price is already safely stored
-    # inside ticker_info.
+    # previous_price has already been saved in memory.
     # -----------------------------------------------------
 
     for ticker in tickers:
 
-        price = prices.get(
-            ticker
+        price = (
+            prices.get(
+                ticker
+            )
         )
 
         if price is None:
@@ -2065,8 +2547,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # 5. Read all @alert ranges
-    #    + remember ticker heading block IDs
+    # 5. Read @alert + remember ticker heading IDs
     # -----------------------------------------------------
 
     (
@@ -2106,7 +2587,7 @@ def main():
     print("")
 
     # -----------------------------------------------------
-    # 6. Check states and send alerts
+    # 6. Check states + send @mention notifications
     # -----------------------------------------------------
 
     process_alert_states(
