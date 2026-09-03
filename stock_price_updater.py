@@ -11,18 +11,21 @@ import yfinance as yf
 # Configuration
 # =========================================================
 
-
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_READER_TOKEN = os.environ["NOTION_READER_TOKEN"]
 
 NOTION_VERSION = "2026-03-11"
 
+# Stocks Price database:
+# Read + Update
 WRITER_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": NOTION_VERSION,
     "Content-Type": "application/json",
 }
 
+# 股票 page:
+# Read content + Insert comments
 READER_HEADERS = {
     "Authorization": f"Bearer {NOTION_READER_TOKEN}",
     "Notion-Version": NOTION_VERSION,
@@ -37,17 +40,17 @@ READER_HEADERS = {
 def find_stock_data_source():
     """
     Find the Stocks Price data source.
-    Uses the writer token because this database is read/write.
     """
+
     url = "https://api.notion.com/v1/search"
 
     payload = {
         "query": "Stocks Price",
         "filter": {
             "property": "object",
-            "value": "data_source"
+            "value": "data_source",
         },
-        "page_size": 20
+        "page_size": 20,
     }
 
     response = requests.post(
@@ -76,7 +79,7 @@ def find_stock_data_source():
 
 def get_stock_rows(data_source_id):
     """
-    Read every row in Stocks Price.
+    Read all rows from Stocks Price.
     """
 
     url = (
@@ -91,6 +94,7 @@ def get_stock_rows(data_source_id):
     }
 
     while True:
+
         response = requests.post(
             url,
             headers=WRITER_HEADERS,
@@ -118,7 +122,7 @@ def get_stock_rows(data_source_id):
 
 def get_ticker(page):
     """
-    Read Ticker from a Stocks Price row.
+    Read ticker symbol from a Stocks Price row.
     """
 
     title_items = (
@@ -138,7 +142,7 @@ def get_ticker(page):
 
 def get_last_alert_range(page):
     """
-    Read internal alert state from Last Alert Range.
+    Read internal alert state.
     """
 
     prop = (
@@ -151,7 +155,7 @@ def get_last_alert_range(page):
 
     items = prop.get(
         "rich_text",
-        []
+        [],
     )
 
     return "".join(
@@ -166,8 +170,8 @@ def get_last_alert_range(page):
 
 def verify_missing_ticker(ticker):
     """
-    If the batch request doesn't return a price,
-    verify the ticker individually.
+    If the batch request cannot return a ticker,
+    verify it individually.
 
     Returns:
 
@@ -175,26 +179,30 @@ def verify_missing_ticker(ticker):
             Valid ticker.
 
         0.0
-            Ticker appears invalid.
+            Appears to be invalid.
 
         None
-            Temporary Yahoo/network failure.
-            Keep old Notion value.
+            Temporary Yahoo/network error.
+            Keep existing Notion price.
     """
 
     try:
-        stock = yf.Ticker(ticker)
+
+        stock = yf.Ticker(
+            ticker
+        )
 
         history = stock.history(
             period="5d",
             interval="1d",
-            auto_adjust=False
+            auto_adjust=False,
         )
 
         if (
             history is None
             or history.empty
         ):
+
             print(
                 f"{ticker}: no market data "
                 f"-> invalid ticker"
@@ -208,6 +216,7 @@ def verify_missing_ticker(ticker):
         )
 
         if close.empty:
+
             print(
                 f"{ticker}: no closing price "
                 f"-> invalid ticker"
@@ -230,6 +239,7 @@ def verify_missing_ticker(ticker):
         return price
 
     except Exception as exc:
+
         print(
             f"{ticker}: verification failed "
             f"({exc}) -> preserve previous price"
@@ -240,7 +250,7 @@ def verify_missing_ticker(ticker):
 
 def get_prices(tickers):
     """
-    Get latest market price for all tickers.
+    Get latest market price.
     """
 
     print(
@@ -254,6 +264,7 @@ def get_prices(tickers):
     }
 
     try:
+
         data = yf.download(
             tickers=tickers,
             period="5d",
@@ -266,13 +277,13 @@ def get_prices(tickers):
         )
 
     except Exception as exc:
+
         print(
             f"Yahoo batch request failed: {exc}"
         )
 
         print(
-            "Keeping all existing "
-            "Notion prices."
+            "Keeping all existing Notion prices."
         )
 
         return prices
@@ -280,17 +291,20 @@ def get_prices(tickers):
     for ticker in tickers:
 
         try:
+
             close = (
                 data[ticker]["Close"]
                 .dropna()
             )
 
             if not close.empty:
+
                 price = float(
                     close.iloc[-1]
                 )
 
                 if price > 0:
+
                     prices[ticker] = price
 
                     print(
@@ -309,7 +323,9 @@ def get_prices(tickers):
         )
 
         prices[ticker] = (
-            verify_missing_ticker(ticker)
+            verify_missing_ticker(
+                ticker
+            )
         )
 
     return prices
@@ -321,7 +337,7 @@ def update_notion_price(
     price,
 ):
     """
-    Update only Current Price and Last Updated.
+    Update Current Price and Last Updated.
     """
 
     now = datetime.now(
@@ -335,14 +351,14 @@ def update_notion_price(
             "Current Price": {
                 "number": round(
                     price,
-                    2
+                    2,
                 )
             },
             "Last Updated": {
                 "date": {
                     "start": now
                 }
-            }
+            },
         }
     }
 
@@ -361,12 +377,14 @@ def update_notion_price(
     response.raise_for_status()
 
     if price == 0:
+
         print(
             f"Updated price {ticker}: "
             f"INVALID TICKER -> $0"
         )
 
     else:
+
         print(
             f"Updated price {ticker}: "
             f"${price:.2f}"
@@ -374,12 +392,12 @@ def update_notion_price(
 
 
 # =========================================================
-# Notion: 股票 notes page
+# Notion: 股票 page
 # =========================================================
 
 def extract_page_title(page):
     """
-    Extract page title from a Notion page result.
+    Extract title from a Notion page result.
     """
 
     for prop in (
@@ -407,7 +425,7 @@ def extract_page_title(page):
 
 def find_stock_notes_page():
     """
-    Find the 股票 page using the read-only token.
+    Find 股票 page using Stock Alert Reader.
     """
 
     url = "https://api.notion.com/v1/search"
@@ -416,9 +434,9 @@ def find_stock_notes_page():
         "query": "股票",
         "filter": {
             "property": "object",
-            "value": "page"
+            "value": "page",
         },
-        "page_size": 20
+        "page_size": 20,
     }
 
     response = requests.post(
@@ -466,14 +484,16 @@ def get_block_text(block):
     Extract plain text from a Notion block.
     """
 
-    block_type = block.get("type")
+    block_type = block.get(
+        "type"
+    )
 
     if not block_type:
         return ""
 
     data = block.get(
         block_type,
-        {}
+        {},
     )
 
     rich_text = data.get(
@@ -510,6 +530,7 @@ def get_block_children(block_id):
         )
 
         if cursor:
+
             url += (
                 f"&start_cursor={cursor}"
             )
@@ -551,11 +572,14 @@ ALERT_PATTERN = re.compile(
 
 def format_number(value):
     """
-    702.0 -> 702
-    96.4  -> 96.4
+    Examples:
+
+        702.0 -> 702
+        96.4  -> 96.4
     """
 
     if float(value).is_integer():
+
         return str(
             int(value)
         )
@@ -568,6 +592,7 @@ def format_number(value):
 
 
 def format_range(low, high):
+
     return (
         f"{format_number(low)}"
         f"-"
@@ -583,11 +608,10 @@ def parse_alert_line(text):
 
     becomes:
 
-        low: 702
-        high: 724
-        range: 702-724
-        display_text:
-            702-724（强）破位走弱 激进
+        low = 702
+        high = 724
+        range = 702-724
+        display_text = 702-724（强）破位走弱 激进
     """
 
     match = ALERT_PATTERN.search(
@@ -606,7 +630,11 @@ def parse_alert_line(text):
     )
 
     if low > high:
-        low, high = high, low
+
+        low, high = (
+            high,
+            low,
+        )
 
     display_text = re.sub(
         r"^\s*@alert\s+",
@@ -623,19 +651,21 @@ def parse_alert_line(text):
         "display_text": display_text,
         "range": format_range(
             low,
-            high
+            high,
         ),
     }
 
+
+# =========================================================
+# Ticker heading detection
+# =========================================================
 
 def ticker_matches_heading(
     text,
     valid_tickers,
 ):
     """
-    Match ticker from headings.
-
-    Examples:
+    Supports headings such as:
 
         SPY
         SPY（*）
@@ -643,10 +673,10 @@ def ticker_matches_heading(
         SPY重要
         SPY重要SPY（*）
 
-    all become SPY.
+    Repeated same ticker is OK.
 
-    If two different valid tickers appear
-    in one heading, skip it.
+    Two different ticker symbols in the same
+    heading are considered ambiguous.
     """
 
     upper_text = text.upper()
@@ -663,18 +693,21 @@ def ticker_matches_heading(
 
         if re.search(
             pattern,
-            upper_text
+            upper_text,
         ):
+
             matches.add(
                 ticker
             )
 
     if len(matches) == 1:
+
         return next(
             iter(matches)
         )
 
     if len(matches) > 1:
+
         print(
             f"Ambiguous ticker heading: "
             f"{text} -> {sorted(matches)}"
@@ -683,29 +716,46 @@ def ticker_matches_heading(
     return None
 
 
+# =========================================================
+# Collect @alert + heading block IDs
+# =========================================================
+
 def collect_alerts_from_page(
     page_id,
     valid_tickers,
 ):
     """
-    Parse the 股票 page by stock SECTION.
+    Parse 股票 page by stock section.
 
-    A ticker section may contain:
-      - embeds
-      - paragraphs
-      - headings
-      - toggles
-      - unrelated notes
-      - multiple @alert blocks
-      - one block containing several lines
+    @alert lines may be:
 
-    We only care about lines beginning with @alert.
+        - separate paragraphs
+        - several lines in one paragraph
+        - inside toggles
+        - separated by unrelated notes
+        - separated by images / embeds
+        - nested inside child blocks
+
+    Other content is ignored.
+
+    Returns:
+
+        alerts_by_ticker
+
+        ticker_heading_ids
+
+    Example:
+
+        ticker_heading_ids["QQQ"]
+            -> Notion block ID of QQQ heading
     """
 
     alerts = {
         ticker: []
         for ticker in valid_tickers
     }
+
+    ticker_heading_ids = {}
 
     heading_types = {
         "heading_1",
@@ -714,37 +764,56 @@ def collect_alerts_from_page(
         "toggle",
     }
 
+    # -----------------------------------------------------
+    # Scan a block and all descendants for @alert
+    # -----------------------------------------------------
+
     def extract_alerts_from_block(
         block,
         ticker,
     ):
-        """
-        Recursively scan one block and all descendants.
-        """
 
-        text = get_block_text(block)
+        text = get_block_text(
+            block
+        )
 
         if text:
-            for raw_line in text.splitlines():
 
-                line = raw_line.strip()
+            for raw_line in (
+                text.splitlines()
+            ):
+
+                line = (
+                    raw_line.strip()
+                )
 
                 if not line:
                     continue
 
-                if not line.lower().startswith("@alert"):
+                if not (
+                    line.lower()
+                    .startswith("@alert")
+                ):
                     continue
 
-                alert = parse_alert_line(line)
+                alert = (
+                    parse_alert_line(
+                        line
+                    )
+                )
 
                 if not alert:
+
                     print(
-                        f"Could not parse alert for "
-                        f"{ticker}: {line}"
+                        f"Could not parse alert "
+                        f"for {ticker}: {line}"
                     )
+
                     continue
 
-                alerts[ticker].append(alert)
+                alerts[ticker].append(
+                    alert
+                )
 
                 print(
                     f"Found alert for {ticker}: "
@@ -752,23 +821,27 @@ def collect_alerts_from_page(
                     f"{alert['display_text']}"
                 )
 
-        # Recursively inspect everything inside
-        # this block.
-        if block.get("has_children"):
+        # Recursively inspect children
+        if block.get(
+            "has_children"
+        ):
 
-            children = get_block_children(
-                block["id"]
+            children = (
+                get_block_children(
+                    block["id"]
+                )
             )
 
             for child in children:
+
                 extract_alerts_from_block(
                     child,
                     ticker,
                 )
 
-    # -------------------------------------------------
-    # Read top-level blocks of 股票 page
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # Read top-level 股票 blocks
+    # -----------------------------------------------------
 
     top_blocks = get_block_children(
         page_id
@@ -778,42 +851,67 @@ def collect_alerts_from_page(
 
     for block in top_blocks:
 
-        text = get_block_text(block)
-        block_type = block.get("type")
+        text = get_block_text(
+            block
+        )
 
-        # ---------------------------------------------
-        # Does this block begin a new stock section?
-        # ---------------------------------------------
+        block_type = block.get(
+            "type"
+        )
 
         detected = None
+
+        # -------------------------------------------------
+        # Does this block begin a new stock section?
+        # -------------------------------------------------
 
         if (
             block_type in heading_types
             and text
         ):
-            detected = ticker_matches_heading(
-                text,
-                valid_tickers,
+
+            detected = (
+                ticker_matches_heading(
+                    text,
+                    valid_tickers,
+                )
             )
 
         if detected:
 
             current_ticker = detected
 
+            # IMPORTANT:
+            # Remember this exact title / toggle block.
+            # Alert comments will be attached here.
+            ticker_heading_ids[
+                detected
+            ] = block["id"]
+
             print(
                 f"\nDetected ticker section: "
                 f"{text} -> {detected}"
             )
 
-            # The ticker heading/toggle itself may
-            # contain all of the stock's content.
-            if block.get("has_children"):
+            print(
+                f"{detected}: heading block "
+                f"-> {block['id']}"
+            )
 
-                children = get_block_children(
-                    block["id"]
+            # If ticker section itself is a toggle,
+            # scan everything nested inside it.
+            if block.get(
+                "has_children"
+            ):
+
+                children = (
+                    get_block_children(
+                        block["id"]
+                    )
                 )
 
                 for child in children:
+
                     extract_alerts_from_block(
                         child,
                         current_ticker,
@@ -821,41 +919,34 @@ def collect_alerts_from_page(
 
             continue
 
-        # ---------------------------------------------
-        # Blocks following a ticker heading also belong
-        # to that ticker until another ticker heading.
-        #
-        # This supports both:
-        #
-        #   ▼ QQQ
-        #       nested content
-        #
-        # and:
-        #
-        #   QQQ heading
-        #   paragraph
-        #   paragraph
-        #   @alert ...
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # Blocks following ticker heading belong to that
+        # ticker until another ticker heading is found.
+        # -------------------------------------------------
 
         if current_ticker:
+
             extract_alerts_from_block(
                 block,
                 current_ticker,
             )
 
-    # -------------------------------------------------
-    # Remove duplicates while preserving Notion order
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # Remove duplicate numeric ranges while preserving
+    # original Notion order.
+    # -----------------------------------------------------
 
     cleaned = {}
 
-    for ticker, ticker_alerts in alerts.items():
+    for ticker, ticker_alerts in (
+        alerts.items()
+    ):
 
         if not ticker_alerts:
             continue
 
         seen = set()
+
         unique_alerts = []
 
         for alert in ticker_alerts:
@@ -868,14 +959,22 @@ def collect_alerts_from_page(
             if key in seen:
                 continue
 
-            seen.add(key)
+            seen.add(
+                key
+            )
+
             unique_alerts.append(
                 alert
             )
 
-        cleaned[ticker] = unique_alerts
+        cleaned[ticker] = (
+            unique_alerts
+        )
 
-    return cleaned
+    return (
+        cleaned,
+        ticker_heading_ids,
+    )
 
 
 # =========================================================
@@ -887,7 +986,7 @@ def determine_alert_state(
     alerts,
 ):
     """
-    Every valid price falls into one state:
+    Every valid price belongs to one state:
 
         RANGE:702-724
 
@@ -903,6 +1002,7 @@ def determine_alert_state(
         or price is None
         or price <= 0
     ):
+
         return None
 
     sorted_alerts = sorted(
@@ -910,12 +1010,12 @@ def determine_alert_state(
         key=lambda x: (
             x["low"],
             x["high"],
-        )
+        ),
     )
 
-    # -----------------------------------------
-    # 1. Inside an alert range
-    # -----------------------------------------
+    # -----------------------------------------------------
+    # RANGE
+    # -----------------------------------------------------
 
     for alert in alerts:
 
@@ -942,9 +1042,9 @@ def determine_alert_state(
         sorted_alerts[-1]
     )
 
-    # -----------------------------------------
-    # 2. Below all ranges
-    # -----------------------------------------
+    # -----------------------------------------------------
+    # BELOW
+    # -----------------------------------------------------
 
     if (
         price
@@ -960,9 +1060,9 @@ def determine_alert_state(
             "alert": lowest_alert,
         }
 
-    # -----------------------------------------
-    # 3. Above all ranges
-    # -----------------------------------------
+    # -----------------------------------------------------
+    # ABOVE
+    # -----------------------------------------------------
 
     if (
         price
@@ -978,9 +1078,9 @@ def determine_alert_state(
             "alert": highest_alert,
         }
 
-    # -----------------------------------------
-    # 4. GAP between two ranges
-    # -----------------------------------------
+    # -----------------------------------------------------
+    # GAP
+    # -----------------------------------------------------
 
     for index in range(
         len(sorted_alerts) - 1
@@ -1027,9 +1127,9 @@ def determine_alert_state(
 
 def build_alert_list_text(alerts):
     """
-    Preserve the original Notion order.
+    Preserve original Notion order.
 
-    @alert itself is removed from display.
+    @alert itself is removed from the displayed message.
     """
 
     return "\n".join(
@@ -1045,7 +1145,7 @@ def build_alert_message(
     alerts,
 ):
     """
-    Build the exact alert format.
+    Build user-facing alert message.
     """
 
     price_text = (
@@ -1132,9 +1232,169 @@ def build_alert_message(
     )
 
     return (
-        f"{headline}\n\n"
+        f"🔔 {headline}\n\n"
         f"{all_alerts}"
     )
+
+
+# =========================================================
+# Notion Comment
+# =========================================================
+
+def split_text_for_notion(
+    text,
+    chunk_size=1800,
+):
+    """
+    Split long messages into multiple rich_text objects.
+
+    This keeps one alert as ONE Notion comment,
+    even when the message is long.
+    """
+
+    chunks = []
+
+    remaining = text
+
+    while remaining:
+
+        if len(remaining) <= chunk_size:
+
+            chunks.append(
+                remaining
+            )
+
+            break
+
+        # Prefer splitting at a newline.
+        split_at = (
+            remaining.rfind(
+                "\n",
+                0,
+                chunk_size,
+            )
+        )
+
+        if split_at <= 0:
+
+            split_at = (
+                chunk_size
+            )
+
+        else:
+
+            # Keep the newline in the previous chunk.
+            split_at += 1
+
+        chunks.append(
+            remaining[:split_at]
+        )
+
+        remaining = (
+            remaining[split_at:]
+        )
+
+    return chunks
+
+
+def send_notion_alert_comment(
+    block_id,
+    ticker,
+    message,
+):
+    """
+    Create a NEW comment attached directly
+    to the ticker's heading/toggle block.
+
+    Examples:
+
+        QQQ alert -> QQQ heading
+        SPY alert -> SPY heading
+        TSM alert -> TSM heading
+
+    Returns True only if Notion confirms success.
+    """
+
+    url = (
+        "https://api.notion.com/v1/comments"
+    )
+
+    chunks = (
+        split_text_for_notion(
+            message
+        )
+    )
+
+    if len(chunks) > 100:
+
+        raise RuntimeError(
+            f"{ticker}: alert message is "
+            f"too long for one Notion comment."
+        )
+
+    rich_text = []
+
+    for chunk in chunks:
+
+        rich_text.append(
+            {
+                "type": "text",
+                "text": {
+                    "content": chunk
+                },
+            }
+        )
+
+    payload = {
+        "parent": {
+            "block_id": block_id
+        },
+        "rich_text": rich_text,
+    }
+
+    print(
+        f"{ticker}: sending Notion comment "
+        f"to heading block {block_id}..."
+    )
+
+    response = requests.post(
+        url,
+        headers=READER_HEADERS,
+        json=payload,
+        timeout=30,
+    )
+
+    if not response.ok:
+
+        print(
+            f"{ticker}: Notion comment failed."
+        )
+
+        print(
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+        return False
+
+    data = response.json()
+
+    comment_id = data.get(
+        "id",
+        "(unknown)"
+    )
+
+    print(
+        f"{ticker}: Notion alert comment "
+        f"created successfully."
+    )
+
+    print(
+        f"{ticker}: comment id "
+        f"-> {comment_id}"
+    )
+
+    return True
 
 
 # =========================================================
@@ -1146,8 +1406,7 @@ def legacy_state_matches(
     new_state,
 ):
     """
-    Support the old state format so upgrading
-    the code does not create a fake alert.
+    Prevent fake alerts when migrating old state format.
 
     Old:
 
@@ -1166,6 +1425,7 @@ def legacy_state_matches(
         not old_state
         or not new_state
     ):
+
         return False
 
     kind = new_state["kind"]
@@ -1215,7 +1475,7 @@ def legacy_state_matches(
 
 
 # =========================================================
-# Save alert state
+# Save Last Alert Range
 # =========================================================
 
 def update_last_alert_range(
@@ -1238,7 +1498,7 @@ def update_last_alert_range(
                     "content": (
                         new_state
                     )
-                }
+                },
             }
         ]
 
@@ -1280,18 +1540,27 @@ def process_alert_states(
     ticker_info,
     prices,
     alerts_by_ticker,
+    ticker_heading_ids,
 ):
     """
-    Compare previous state vs current state.
+    Rules:
 
     First initialization:
         Save state only.
+        No notification.
 
     Same state:
         Do nothing.
 
-    Different state:
-        Generate alert message.
+    State changed:
+        1. Build message
+        2. Send Notion comment
+        3. ONLY after comment succeeds,
+           update Last Alert Range
+
+    If comment fails:
+        Do NOT update Last Alert Range.
+        Next run will retry.
     """
 
     for ticker, alerts in (
@@ -1315,9 +1584,9 @@ def process_alert_states(
             ticker
         )
 
-        # -----------------------------------------
-        # Invalid or missing price
-        # -----------------------------------------
+        # -------------------------------------------------
+        # Missing / invalid market price
+        # -------------------------------------------------
 
         if (
             price is None
@@ -1365,9 +1634,12 @@ def process_alert_states(
             f"new={new_state}"
         )
 
-        # =========================================
+        # =================================================
         # FIRST TIME
-        # =========================================
+        #
+        # Establish current state only.
+        # Do not send notification.
+        # =================================================
 
         if not old_state:
 
@@ -1385,9 +1657,19 @@ def process_alert_states(
 
             continue
 
-        # =========================================
-        # MIGRATE OLD STATE FORMAT
-        # =========================================
+        # =================================================
+        # MIGRATE OLD FORMAT
+        #
+        # Example:
+        #
+        #   702-724
+        #
+        # becomes:
+        #
+        #   RANGE:702-724
+        #
+        # No fake notification.
+        # =================================================
 
         if legacy_state_matches(
             old_state,
@@ -1408,9 +1690,11 @@ def process_alert_states(
 
             continue
 
-        # =========================================
+        # =================================================
         # SAME STATE
-        # =========================================
+        #
+        # No repeated notification.
+        # =================================================
 
         if old_state == new_state:
 
@@ -1421,9 +1705,9 @@ def process_alert_states(
 
             continue
 
-        # =========================================
+        # =================================================
         # STATE CHANGED
-        # =========================================
+        # =================================================
 
         message = (
             build_alert_message(
@@ -1438,20 +1722,81 @@ def process_alert_states(
         print("=" * 70)
         print("ALERT")
         print("=" * 70)
-
         print(message)
-
         print("=" * 70)
         print("")
 
-        # -----------------------------------------
-        # IMPORTANT
+        # -------------------------------------------------
+        # Find ticker's exact Notion heading block.
+        # -------------------------------------------------
+
+        heading_block_id = (
+            ticker_heading_ids.get(
+                ticker
+            )
+        )
+
+        if not heading_block_id:
+
+            print(
+                f"{ticker}: ERROR - "
+                f"ticker heading block ID "
+                f"not found."
+            )
+
+            print(
+                f"{ticker}: Last Alert Range "
+                f"will NOT be updated."
+            )
+
+            print(
+                f"{ticker}: next run will retry."
+            )
+
+            continue
+
+        # -------------------------------------------------
+        # IMPORTANT:
         #
-        # Right now we only PRINT the alert.
+        # Send comment FIRST.
         #
-        # Next step:
-        # send this message to Notion.
-        # -----------------------------------------
+        # Only update Last Alert Range after
+        # the comment succeeds.
+        # -------------------------------------------------
+
+        comment_success = (
+            send_notion_alert_comment(
+                block_id=heading_block_id,
+                ticker=ticker,
+                message=message,
+            )
+        )
+
+        if not comment_success:
+
+            print(
+                f"{ticker}: alert delivery "
+                f"failed."
+            )
+
+            print(
+                f"{ticker}: keeping "
+                f"Last Alert Range = "
+                f"{old_state}"
+            )
+
+            print(
+                f"{ticker}: will retry "
+                f"on the next run."
+            )
+
+            continue
+
+        # -------------------------------------------------
+        # Notification succeeded.
+        #
+        # Now save the new state.
+        # -------------------------------------------------
 
         update_last_alert_range(
             info["page_id"],
@@ -1466,24 +1811,28 @@ def process_alert_states(
 
 def main():
 
-    # -----------------------------------------
+    # -----------------------------------------------------
     # 1. Read Stocks Price
-    # -----------------------------------------
+    # -----------------------------------------------------
 
     data_source_id = (
         find_stock_data_source()
     )
 
-    pages = get_stock_rows(
-        data_source_id
+    pages = (
+        get_stock_rows(
+            data_source_id
+        )
     )
 
     ticker_info = {}
 
     for page in pages:
 
-        ticker = get_ticker(
-            page
+        ticker = (
+            get_ticker(
+                page
+            )
         )
 
         if not ticker:
@@ -1513,17 +1862,19 @@ def main():
         ticker_info.keys()
     )
 
-    # -----------------------------------------
+    # -----------------------------------------------------
     # 2. Get latest prices
-    # -----------------------------------------
+    # -----------------------------------------------------
 
-    prices = get_prices(
-        tickers
+    prices = (
+        get_prices(
+            tickers
+        )
     )
 
-    # -----------------------------------------
-    # 3. Update price database
-    # -----------------------------------------
+    # -----------------------------------------------------
+    # 3. Update Stocks Price
+    # -----------------------------------------------------
 
     for ticker in tickers:
 
@@ -1549,20 +1900,27 @@ def main():
             price,
         )
 
-    # -----------------------------------------
-    # 4. Read @alert from 股票 page
-    # -----------------------------------------
+    # -----------------------------------------------------
+    # 4. Find 股票 page
+    # -----------------------------------------------------
 
     notes_page_id = (
         find_stock_notes_page()
     )
 
-    alerts_by_ticker = (
-        collect_alerts_from_page(
-            notes_page_id,
-            set(tickers),
-        )
+    # -----------------------------------------------------
+    # 5. Read @alert AND remember ticker heading IDs
+    # -----------------------------------------------------
+
+    (
+        alerts_by_ticker,
+        ticker_heading_ids,
+    ) = collect_alerts_from_page(
+        notes_page_id,
+        set(tickers),
     )
+
+    print("")
 
     print(
         "Tickers with alerts: "
@@ -1573,14 +1931,32 @@ def main():
         )
     )
 
-    # -----------------------------------------
-    # 5. Determine alert states
-    # -----------------------------------------
+    print("")
+
+    print(
+        "Ticker heading blocks:"
+    )
+
+    for ticker in sorted(
+        ticker_heading_ids.keys()
+    ):
+
+        print(
+            f"  {ticker}: "
+            f"{ticker_heading_ids[ticker]}"
+        )
+
+    print("")
+
+    # -----------------------------------------------------
+    # 6. Determine alert states and send notifications
+    # -----------------------------------------------------
 
     process_alert_states(
         ticker_info,
         prices,
         alerts_by_ticker,
+        ticker_heading_ids,
     )
 
     print("Finished.")
