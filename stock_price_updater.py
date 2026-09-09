@@ -36,7 +36,10 @@ NOTION_NOTIFY_USER_NAME = os.environ.get(
 
 
 # Stocks Price database:
-# Read + Update
+# Read + Update + Insert
+#
+# Insert is required because the script can automatically
+# create missing ticker rows discovered in 股票.
 WRITER_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": NOTION_VERSION,
@@ -1057,62 +1060,392 @@ def parse_alert_line(text):
 # Ticker heading detection
 # =========================================================
 
+# A ticker section must START with a ticker-like symbol.
+#
+# Examples that ARE ticker sections:
+#
+#     QQQ
+#     NVDA（*）
+#     XLK 科技行业精选指数ETF-SPDR（参考）
+#     JPM 小摩
+#     GS 高盛
+#     BRK-B
+#     ^GSPC标普500（参考）
+#
+# Examples that are NOT ticker sections:
+#
+#     ————常用指数————
+#     ————半导体个股————
+#     ————科技个股————
+#     ————参考指数————
+#     ————其他个股————
+#     高估股票
+#     正价股票
+#     低估股票
+#
+# This is intentionally prefix-based.  A ticker appearing later
+# in a Chinese heading does NOT turn that heading into a stock.
+HEADING_TICKER_PATTERN = re.compile(
+    r"^\s*[^\w^]*"
+    r"(\^[A-Z][A-Z0-9.\-]{0,9}|[A-Z][A-Z0-9.\-]{0,9})"
+    r"(?=$|[\s（(＊*：:【\[]|[\u3400-\u4DBF\u4E00-\u9FFF])",
+    re.IGNORECASE,
+)
+
+
+CHINESE_CHARACTER_PATTERN = re.compile(
+    r"[\u3400-\u4DBF\u4E00-\u9FFF]"
+)
+
+
+def extract_ticker_candidate_from_heading(text):
+    """
+    Extract a ticker-like code only from the START of a heading.
+
+    Returns for example:
+
+        "NVDA（*）"                 -> "NVDA"
+        "JPM 小摩"                 -> "JPM"
+        "BRK-B"                    -> "BRK-B"
+        "^GSPC标普500（参考）"      -> "^GSPC"
+        "————半导体个股————"       -> None
+        "高估股票"                  -> None
+    """
+
+    if not text:
+        return None
+
+    match = HEADING_TICKER_PATTERN.search(
+        text
+    )
+
+    if not match:
+        return None
+
+    return (
+        match.group(1)
+        .strip()
+        .upper()
+    )
+
+
+def is_chinese_section_heading(text):
+    """
+    Return True when a top-level heading is a Chinese/category
+    separator rather than a ticker section.
+
+    Decorative punctuation before the Chinese text is ignored,
+    so this also catches headings such as:
+
+        ————半导体个股————
+        ————科技个股————
+        ————常用指数————
+
+    A real ticker prefix wins first.  Therefore this does NOT
+    treat the following as a Chinese category heading:
+
+        ^GSPC标普500（参考）
+        XLK 科技行业精选指数ETF-SPDR（参考）
+        JPM 小摩
+    """
+
+    if not text:
+        return False
+
+    if extract_ticker_candidate_from_heading(
+        text
+    ):
+        return False
+
+    stripped = text.strip()
+
+    # Remove only decorative separators from the beginning.
+    # Do NOT remove letters, numbers or ^.
+    stripped = re.sub(
+        r"^[\s\-—–_=·•◆◇★☆━─]+",
+        "",
+        stripped,
+    )
+
+    if not stripped:
+        return False
+
+    return bool(
+        CHINESE_CHARACTER_PATTERN.match(
+            stripped[0]
+        )
+    )
+
+
 def ticker_matches_heading(
     text,
     valid_tickers,
 ):
     """
-    Supports:
-
-        SPY
-        SPY（*）
-        ⭐SPY
-        SPY重要
-        SPY重要SPY（*）
-
-    Repeated same ticker is fine.
-
-    Two different tickers in one heading:
-    ambiguous -> skip.
+    Match a top-level heading to a ticker that already exists in
+    Stocks Price.  Matching is prefix-based, not substring-based.
     """
 
-    upper_text = (
-        text.upper()
+    candidate = (
+        extract_ticker_candidate_from_heading(
+            text
+        )
     )
 
-    matches = set()
+    if not candidate:
+        return None
 
-    for ticker in valid_tickers:
-
-        pattern = (
-            r"(?<![A-Z])"
-            + re.escape(ticker)
-            + r"(?![A-Z])"
-        )
-
-        if re.search(
-            pattern,
-            upper_text,
-        ):
-
-            matches.add(
-                ticker
-            )
-
-    if len(matches) == 1:
-
-        return next(
-            iter(matches)
-        )
-
-    if len(matches) > 1:
-
-        print(
-            f"Ambiguous ticker heading: "
-            f"{text} -> {sorted(matches)}"
-        )
+    if candidate in valid_tickers:
+        return candidate
 
     return None
+
+
+def discover_ticker_headings(page_id):
+    """
+    Discover ticker-like top-level headings from 股票, even when
+    the ticker does not yet exist in Stocks Price.
+
+    This is used BEFORE price download so missing ticker rows can
+    be created automatically.
+
+    Chinese/category headings are ignored.
+    """
+
+    heading_types = {
+        "heading_1",
+        "heading_2",
+        "heading_3",
+        "toggle",
+    }
+
+    top_blocks = (
+        get_block_children(
+            page_id
+        )
+    )
+
+    discovered = []
+    seen = set()
+
+    for block in top_blocks:
+
+        block_type = block.get(
+            "type"
+        )
+
+        if block_type not in heading_types:
+            continue
+
+        text = (
+            get_block_text(
+                block
+            )
+        )
+
+        if not text:
+            continue
+
+        candidate = (
+            extract_ticker_candidate_from_heading(
+                text
+            )
+        )
+
+        if not candidate:
+            continue
+
+        if candidate in seen:
+            continue
+
+        seen.add(
+            candidate
+        )
+
+        discovered.append(
+            candidate
+        )
+
+        print(
+            f"Discovered ticker heading: "
+            f"{text} -> {candidate}"
+        )
+
+    return discovered
+
+
+def create_stock_row(
+    data_source_id,
+    ticker,
+):
+    """
+    Create a new row in Stocks Price for a ticker discovered in
+    the 股票 page but missing from the database.
+
+    IMPORTANT:
+
+    The Stock Price Updater Notion connection needs:
+
+        Read content
+        Update content
+        Insert content
+
+    Without Insert content, Notion returns HTTP 403.
+
+    Returns the newly created page object, or None when creation
+    could not be completed.
+    """
+
+    url = (
+        "https://api.notion.com/v1/pages"
+    )
+
+    payload = {
+        "parent": {
+            "type": "data_source_id",
+            "data_source_id": (
+                data_source_id
+            ),
+        },
+        "properties": {
+            "Ticker": {
+                "title": [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": ticker
+                        },
+                    }
+                ]
+            }
+        },
+    }
+
+    response = requests.post(
+        url,
+        headers=WRITER_HEADERS,
+        json=payload,
+        timeout=30,
+    )
+
+    if response.status_code == 403:
+
+        print(
+            f"{ticker}: cannot create Stocks Price row. "
+            f"Enable Insert content for the "
+            f"Stock Price Updater Notion connection."
+        )
+
+        return None
+
+    if not response.ok:
+
+        print(
+            f"{ticker}: failed to create Stocks Price row."
+        )
+
+        print(
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+        return None
+
+    page = response.json()
+
+    print(
+        f"Added missing ticker to Stocks Price: "
+        f"{ticker}"
+    )
+
+    return page
+
+
+def add_missing_note_tickers_to_stock_price(
+    data_source_id,
+    notes_page_id,
+    ticker_info,
+):
+    """
+    Find ticker headings in 股票 that are missing from Stocks
+    Price, validate them with Yahoo Finance, and create rows.
+
+    Invalid-looking or non-existent Yahoo symbols are NOT added.
+    Temporary Yahoo failures are deferred until the next run.
+    """
+
+    discovered = (
+        discover_ticker_headings(
+            notes_page_id
+        )
+    )
+
+    missing = [
+        ticker
+        for ticker in discovered
+        if ticker not in ticker_info
+    ]
+
+    if not missing:
+
+        print(
+            "No ticker headings are missing "
+            "from Stocks Price."
+        )
+
+        return
+
+    print(
+        "Ticker headings missing from Stocks Price: "
+        + ", ".join(missing)
+    )
+
+    for ticker in missing:
+
+        print(
+            f"Validating missing ticker {ticker}..."
+        )
+
+        validation_price = (
+            verify_missing_ticker(
+                ticker
+            )
+        )
+
+        if validation_price is None:
+
+            print(
+                f"{ticker}: temporary Yahoo failure; "
+                f"automatic row creation deferred."
+            )
+
+            continue
+
+        if validation_price <= 0:
+
+            print(
+                f"{ticker}: ticker heading was found, "
+                f"but Yahoo did not validate it; "
+                f"not adding it to Stocks Price."
+            )
+
+            continue
+
+        page = (
+            create_stock_row(
+                data_source_id,
+                ticker,
+            )
+        )
+
+        if not page:
+            continue
+
+        ticker_info[ticker] = {
+            "page_id": page["id"],
+            "last_alert_range": "",
+            "previous_price": None,
+        }
 
 
 # =========================================================
@@ -1260,12 +1593,19 @@ def collect_alerts_from_page(
         )
 
         detected = None
+        candidate = None
 
         if (
             block_type
             in heading_types
             and text
         ):
+
+            candidate = (
+                extract_ticker_candidate_from_heading(
+                    text
+                )
+            )
 
             detected = (
                 ticker_matches_heading(
@@ -1313,6 +1653,66 @@ def collect_alerts_from_page(
                         current_ticker,
                     )
 
+            continue
+
+        # -------------------------------------------------
+        # Chinese/category section boundary
+        # -------------------------------------------------
+        #
+        # Examples:
+        #
+        #     ————半导体个股————
+        #     ————科技个股————
+        #     ————参考指数————
+        #     ————其他个股————
+        #     高估股票
+        #     正价股票
+        #     低估股票
+        #
+        # Once one of these top-level headings is reached,
+        # alerts below it must NOT leak into the previous stock.
+        # -------------------------------------------------
+
+        if (
+            block_type
+            in heading_types
+            and text
+            and is_chinese_section_heading(
+                text
+            )
+        ):
+
+            print(
+                f"Section boundary (not a ticker): "
+                f"{text}"
+            )
+
+            current_ticker = None
+            continue
+
+        # -------------------------------------------------
+        # Ticker-looking heading that is still unavailable
+        # -------------------------------------------------
+        #
+        # Normally auto-add runs before this parser.  If a
+        # candidate could not be added/validated, stop the
+        # previous ticker here so its @alert lines cannot be
+        # assigned to the wrong stock.
+        # -------------------------------------------------
+
+        if (
+            block_type
+            in heading_types
+            and candidate
+            and not detected
+        ):
+
+            print(
+                f"Ticker-like heading is not active: "
+                f"{text} -> {candidate}"
+            )
+
+            current_ticker = None
             continue
 
         # -------------------------------------------------
@@ -2485,6 +2885,50 @@ def main():
             ),
         }
 
+    # -----------------------------------------------------
+    # 2. Find 股票 page EARLY
+    #
+    # We do this before downloading prices because the notes
+    # page may contain a ticker heading that has not yet been
+    # added to Stocks Price.
+    # -----------------------------------------------------
+
+    notes_page_id = (
+        find_stock_notes_page()
+    )
+
+    # -----------------------------------------------------
+    # 3. Automatically add missing ticker headings
+    # -----------------------------------------------------
+    #
+    # Example:
+    #
+    #     A new heading appears in 股票:
+    #
+    #         JPM 小摩
+    #
+    #     but JPM is not yet in Stocks Price.
+    #
+    # The program validates JPM with Yahoo Finance and then
+    # creates a new Stocks Price row automatically.
+    #
+    # Chinese/category headings are ignored, including:
+    #
+    #     ————半导体个股————
+    #     高估股票
+    #     正价股票
+    #     低估股票
+    #
+    # ^GSPC标普500（参考） is preserved because it STARTS
+    # with a real ticker code: ^GSPC.
+    # -----------------------------------------------------
+
+    add_missing_note_tickers_to_stock_price(
+        data_source_id,
+        notes_page_id,
+        ticker_info,
+    )
+
     if not ticker_info:
 
         raise RuntimeError(
@@ -2497,7 +2941,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # 2. Download latest prices
+    # 4. Download latest prices
     # -----------------------------------------------------
 
     prices = (
@@ -2507,7 +2951,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # 3. Update Stocks Price
+    # 5. Update Stocks Price
     #
     # previous_price has already been saved in memory.
     # -----------------------------------------------------
@@ -2539,15 +2983,7 @@ def main():
         )
 
     # -----------------------------------------------------
-    # 4. Find 股票 page
-    # -----------------------------------------------------
-
-    notes_page_id = (
-        find_stock_notes_page()
-    )
-
-    # -----------------------------------------------------
-    # 5. Read @alert + remember ticker heading IDs
+    # 6. Read @alert + remember ticker heading IDs
     # -----------------------------------------------------
 
     (
@@ -2587,7 +3023,7 @@ def main():
     print("")
 
     # -----------------------------------------------------
-    # 6. Check states + send @mention notifications
+    # 7. Check states + send @mention notifications
     # -----------------------------------------------------
 
     process_alert_states(
