@@ -308,9 +308,189 @@ def verify_missing_ticker(ticker):
         return None
 
 
+
+def get_intraday_daily_range(
+    ticker,
+    ticker_data,
+):
+    """
+    Calculate today's intraday high / low from the SAME 1-minute
+    yfinance data that is already downloaded in get_prices().
+
+    The trading day is determined using America/New_York.
+
+    Because yf.download(..., prepost=True) is already used,
+    today's range naturally includes:
+        pre-market
+        regular session
+        after-hours
+
+    Returns:
+        {
+            "high": float,
+            "low": float,
+            "date": "YYYY-MM-DD",
+        }
+
+    or:
+        None
+
+    No extra Yahoo request is made here.
+    """
+
+    try:
+
+        if (
+            ticker_data is None
+            or ticker_data.empty
+        ):
+            return None
+
+        index = ticker_data.index
+
+        if not hasattr(
+            index,
+            "tz"
+        ):
+            return None
+
+        # Intraday yfinance indexes are normally timezone-aware.
+        #
+        # If a future yfinance version returns a naive index,
+        # interpret it as UTC rather than guessing local machine time.
+        if index.tz is None:
+
+            eastern_index = (
+                index
+                .tz_localize("UTC")
+                .tz_convert(
+                    "America/New_York"
+                )
+            )
+
+        else:
+
+            eastern_index = (
+                index
+                .tz_convert(
+                    "America/New_York"
+                )
+            )
+
+        today_eastern = (
+            datetime.now(
+                ZoneInfo(
+                    "America/New_York"
+                )
+            ).date()
+        )
+
+        today_mask = [
+            timestamp.date()
+            == today_eastern
+            for timestamp
+            in eastern_index
+        ]
+
+        today_data = (
+            ticker_data.loc[
+                today_mask
+            ]
+        )
+
+        if today_data.empty:
+
+            print(
+                f"{ticker}: no 1-minute bars "
+                f"for {today_eastern}; "
+                f"Daily High/Low unchanged."
+            )
+
+            return None
+
+        highs = (
+            today_data["High"]
+            .dropna()
+        )
+
+        lows = (
+            today_data["Low"]
+            .dropna()
+        )
+
+        if (
+            highs.empty
+            or lows.empty
+        ):
+
+            print(
+                f"{ticker}: today's 1-minute "
+                f"High/Low data is incomplete; "
+                f"Daily High/Low unchanged."
+            )
+
+            return None
+
+        daily_high = float(
+            highs.max()
+        )
+
+        daily_low = float(
+            lows.min()
+        )
+
+        if (
+            daily_high <= 0
+            or daily_low <= 0
+            or daily_high < daily_low
+        ):
+
+            print(
+                f"{ticker}: invalid daily range "
+                f"from 1-minute data; "
+                f"Daily High/Low unchanged."
+            )
+
+            return None
+
+        result = {
+            "high": daily_high,
+            "low": daily_low,
+            "date": (
+                today_eastern.isoformat()
+            ),
+        }
+
+        print(
+            f"{ticker}: daily range "
+            f"{result['date']} "
+            f"high=${daily_high:.2f}, "
+            f"low=${daily_low:.2f}"
+        )
+
+        return result
+
+    except Exception as exc:
+
+        print(
+            f"{ticker}: could not calculate "
+            f"Daily High/Low ({exc}); "
+            f"keeping existing values."
+        )
+
+        return None
+
+
 def get_prices(tickers):
     """
     Download latest market prices.
+
+    Returns:
+        prices
+        daily_ranges
+
+    daily_ranges is calculated from the same 1-minute batch data,
+    so no additional Yahoo request is needed.
     """
 
     print(
@@ -319,6 +499,11 @@ def get_prices(tickers):
     )
 
     prices = {
+        ticker: None
+        for ticker in tickers
+    }
+
+    daily_ranges = {
         ticker: None
         for ticker in tickers
     }
@@ -343,17 +528,52 @@ def get_prices(tickers):
         )
 
         print(
-            "Keeping all existing Notion prices."
+            "Keeping all existing Notion prices "
+            "and Daily High/Low values."
         )
 
-        return prices
+        return (
+            prices,
+            daily_ranges,
+        )
 
     for ticker in tickers:
+
+        ticker_data = None
+
+        try:
+
+            ticker_data = (
+                data[ticker]
+            )
+
+        except Exception:
+            ticker_data = None
+
+        # -------------------------------------------------
+        # Daily High / Daily Low
+        #
+        # Reuse the same 1-minute batch response.
+        # No second yfinance request.
+        # -------------------------------------------------
+
+        if ticker_data is not None:
+
+            daily_ranges[ticker] = (
+                get_intraday_daily_range(
+                    ticker,
+                    ticker_data,
+                )
+            )
+
+        # -------------------------------------------------
+        # Current Price
+        # -------------------------------------------------
 
         try:
 
             close = (
-                data[ticker]["Close"]
+                ticker_data["Close"]
                 .dropna()
             )
 
@@ -377,6 +597,18 @@ def get_prices(tickers):
         except Exception:
             pass
 
+        # -------------------------------------------------
+        # Fallback
+        #
+        # Existing behavior is preserved:
+        # verify with 1-day bars.
+        #
+        # IMPORTANT:
+        # A 1-day fallback price does NOT overwrite Daily High/Low.
+        # Daily High/Low stays unchanged until valid 1-minute
+        # data is available again.
+        # -------------------------------------------------
+
         print(
             f"{ticker}: batch price missing, "
             f"verifying..."
@@ -388,16 +620,32 @@ def get_prices(tickers):
             )
         )
 
-    return prices
+    return (
+        prices,
+        daily_ranges,
+    )
 
 
 def update_notion_price(
     page_id,
     ticker,
     price,
+    daily_range=None,
 ):
     """
-    Update Current Price and Last Updated.
+    Update Stocks Price in ONE Notion PATCH.
+
+    Always updates:
+        Current Price
+        Last Updated
+
+    When today's 1-minute range is available, the SAME PATCH
+    also updates:
+        Daily High
+        Daily Low
+        Daily Range Date
+
+    This keeps the Notion API request count the same as before.
     """
 
     now = datetime.now(
@@ -406,20 +654,55 @@ def update_notion_price(
         )
     ).isoformat()
 
-    payload = {
-        "properties": {
-            "Current Price": {
-                "number": round(
-                    price,
-                    2,
-                )
-            },
-            "Last Updated": {
-                "date": {
-                    "start": now
-                }
-            },
+    properties = {
+        "Current Price": {
+            "number": round(
+                price,
+                2,
+            )
+        },
+        "Last Updated": {
+            "date": {
+                "start": now
+            }
+        },
+    }
+
+    if (
+        daily_range
+        and price > 0
+    ):
+
+        properties[
+            "Daily High"
+        ] = {
+            "number": round(
+                daily_range["high"],
+                2,
+            )
         }
+
+        properties[
+            "Daily Low"
+        ] = {
+            "number": round(
+                daily_range["low"],
+                2,
+            )
+        }
+
+        properties[
+            "Daily Range Date"
+        ] = {
+            "date": {
+                "start": (
+                    daily_range["date"]
+                )
+            }
+        }
+
+    payload = {
+        "properties": properties
     }
 
     url = (
@@ -449,6 +732,15 @@ def update_notion_price(
             f"Updated price {ticker}: "
             f"${price:.2f}"
         )
+
+        if daily_range:
+
+            print(
+                f"Updated daily range {ticker}: "
+                f"high=${daily_range['high']:.2f}, "
+                f"low=${daily_range['low']:.2f}, "
+                f"date={daily_range['date']}"
+            )
 
 
 # =========================================================
@@ -1996,12 +2288,102 @@ def build_alert_list_text(alerts):
     )
 
 
+
+def build_daily_range_text(
+    price,
+    daily_range,
+):
+    """
+    Build the daily high / low context shown in every alert.
+
+    Example:
+
+        今日最高 194.00 → 当前 165.96
+        回落 -28.04（-14.45%）
+
+        今日最低 164.80 → 当前 165.96
+        反弹 +1.16（+0.70%）
+
+    Daily range includes pre-market / regular / after-hours
+    because the source 1-minute data uses prepost=True.
+    """
+
+    if not daily_range:
+        return ""
+
+    try:
+
+        daily_high = float(
+            daily_range["high"]
+        )
+
+        daily_low = float(
+            daily_range["low"]
+        )
+
+        current = float(
+            price
+        )
+
+        if (
+            daily_high <= 0
+            or daily_low <= 0
+            or current <= 0
+        ):
+            return ""
+
+        from_high_amount = (
+            current - daily_high
+        )
+
+        from_high_pct = (
+            (
+                current
+                / daily_high
+            )
+            - 1
+        ) * 100
+
+        from_low_amount = (
+            current - daily_low
+        )
+
+        from_low_pct = (
+            (
+                current
+                / daily_low
+            )
+            - 1
+        ) * 100
+
+        return (
+            f"今日最高 {daily_high:.2f} "
+            f"→ 当前 {current:.2f}\n"
+            f"回落 {from_high_amount:+.2f}"
+            f"（{from_high_pct:+.2f}%）\n\n"
+            f"今日最低 {daily_low:.2f} "
+            f"→ 当前 {current:.2f}\n"
+            f"反弹 {from_low_amount:+.2f}"
+            f"（{from_low_pct:+.2f}%）"
+        )
+
+    except Exception as exc:
+
+        print(
+            f"Could not build daily range "
+            f"alert text: {exc}"
+        )
+
+        return ""
+
+
 def build_alert_message(
     ticker,
     price,
     previous_price,
     state,
     alerts,
+    daily_range=None,
 ):
     """
     Build user-facing alert message.
@@ -2151,9 +2533,29 @@ def build_alert_message(
         )
     )
 
-    return (
-        f"{icon} {headline}\n\n"
-        f"{all_alerts}"
+    daily_range_text = (
+        build_daily_range_text(
+            price,
+            daily_range,
+        )
+    )
+
+    message_parts = [
+        f"{icon} {headline}"
+    ]
+
+    if daily_range_text:
+
+        message_parts.append(
+            daily_range_text
+        )
+
+    message_parts.append(
+        all_alerts
+    )
+
+    return "\n\n".join(
+        message_parts
     )
 
 
@@ -2509,6 +2911,7 @@ def update_last_alert_range(
 def process_alert_states(
     ticker_info,
     prices,
+    daily_ranges,
     alerts_by_ticker,
     ticker_heading_ids,
 ):
@@ -2706,6 +3109,11 @@ def process_alert_states(
                 ),
                 state=state,
                 alerts=alerts,
+                daily_range=(
+                    daily_ranges.get(
+                        ticker
+                    )
+                ),
             )
         )
 
@@ -2944,10 +3352,11 @@ def main():
     # 4. Download latest prices
     # -----------------------------------------------------
 
-    prices = (
-        get_prices(
-            tickers
-        )
+    (
+        prices,
+        daily_ranges,
+    ) = get_prices(
+        tickers
     )
 
     # -----------------------------------------------------
@@ -2980,6 +3389,11 @@ def main():
             ]["page_id"],
             ticker,
             price,
+            daily_range=(
+                daily_ranges.get(
+                    ticker
+                )
+            ),
         )
 
     # -----------------------------------------------------
@@ -3029,6 +3443,7 @@ def main():
     process_alert_states(
         ticker_info,
         prices,
+        daily_ranges,
         alerts_by_ticker,
         ticker_heading_ids,
     )
