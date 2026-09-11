@@ -1,5 +1,8 @@
 import os
 import re
+import json
+import secrets
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -482,30 +485,546 @@ def resolve_tradingview_symbol(ticker):
         return None
 
 
-def get_tradingview_fallback_price(ticker):
+def _tradingview_message(method, params):
     """
-    Get the latest available TradingView quote for a ticker.
-
-    This is the SECOND data-source fallback and is called only
-    after both Yahoo 1-minute data and Yahoo daily fallback fail.
-
-    For S5TW the pinned TradingView symbol is INDEX:S5TW.
-
-    Returns:
-        > 0     valid TradingView price
-        None    TradingView could not provide a usable quote
-
-    Daily High / Daily Low are intentionally NOT populated from
-    this fallback.  Those fields keep the existing yfinance 1-minute
-    definition and remain unchanged when Yahoo intraday data is absent.
+    Build one TradingView websocket protocol frame.
     """
 
-    full_symbol = resolve_tradingview_symbol(
-        ticker
+    payload = json.dumps(
+        {
+            "m": method,
+            "p": params,
+        },
+        separators=(",", ":"),
     )
 
-    if not full_symbol:
+    length = len(
+        payload.encode("utf-8")
+    )
+
+    return (
+        f"~m~{length}~m~{payload}"
+    )
+
+
+def _tradingview_raw_frame(payload):
+    """
+    Wrap an already-serialized TradingView payload.
+
+    This is mainly used to echo TradingView heartbeat messages.
+    """
+
+    length = len(
+        payload.encode("utf-8")
+    )
+
+    return (
+        f"~m~{length}~m~{payload}"
+    )
+
+
+def _split_tradingview_frames(message):
+    """
+    Split a websocket message that may contain several TradingView
+    ~m~<length>~m~ frames.
+
+    TradingView payloads themselves do not use this delimiter, so a
+    regex split is enough for the quote / chart messages we consume.
+    """
+
+    if isinstance(message, bytes):
+        message = message.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    parts = re.split(
+        r"~m~\d+~m~",
+        message,
+    )
+
+    return [
+        part
+        for part in parts
+        if part
+    ]
+
+
+def _extract_tradingview_price_from_payload(payload, full_symbol):
+    """
+    Extract the latest usable price from one decoded TradingView
+    websocket JSON payload.
+
+    We accept either:
+      - qsd quote updates (lp = last price)
+      - timescale_update / du chart bars (close = v[4])
+    """
+
+    method = payload.get("m")
+    params = payload.get("p", [])
+
+    # -----------------------------------------------------
+    # Quote-session update
+    # -----------------------------------------------------
+    if method == "qsd":
+
+        if len(params) < 2:
+            return None
+
+        quote = params[1]
+
+        if not isinstance(quote, dict):
+            return None
+
+        symbol = str(
+            quote.get("n", "")
+        ).upper()
+
+        if (
+            symbol
+            and symbol != full_symbol.upper()
+        ):
+            return None
+
+        values = quote.get(
+            "v",
+            {},
+        )
+
+        if not isinstance(values, dict):
+            return None
+
+        raw_price = values.get("lp")
+
+        if raw_price is None:
+            raw_price = values.get(
+                "rtc"
+            )
+
+        try:
+            price = float(raw_price)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        if price > 0:
+            return price
+
         return None
+
+    # -----------------------------------------------------
+    # Chart-session OHLC update
+    #
+    # TradingView bar vector:
+    #   [timestamp, open, high, low, close, volume]
+    # -----------------------------------------------------
+    if method in {
+        "timescale_update",
+        "du",
+    }:
+
+        if len(params) < 2:
+            return None
+
+        series_container = params[1]
+
+        if not isinstance(
+            series_container,
+            dict,
+        ):
+            return None
+
+        latest_timestamp = None
+        latest_close = None
+
+        for series in (
+            series_container.values()
+        ):
+
+            if not isinstance(
+                series,
+                dict,
+            ):
+                continue
+
+            bars = series.get(
+                "s",
+                [],
+            )
+
+            if not isinstance(
+                bars,
+                list,
+            ):
+                continue
+
+            for bar in bars:
+
+                if not isinstance(
+                    bar,
+                    dict,
+                ):
+                    continue
+
+                values = bar.get(
+                    "v",
+                    [],
+                )
+
+                if (
+                    not isinstance(
+                        values,
+                        list,
+                    )
+                    or len(values) < 5
+                ):
+                    continue
+
+                try:
+                    timestamp = float(
+                        values[0]
+                    )
+                    close = float(
+                        values[4]
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+                if close <= 0:
+                    continue
+
+                if (
+                    latest_timestamp is None
+                    or timestamp
+                    >= latest_timestamp
+                ):
+                    latest_timestamp = timestamp
+                    latest_close = close
+
+        return latest_close
+
+    return None
+
+
+def get_tradingview_websocket_price(
+    ticker,
+    full_symbol,
+):
+    """
+    Fetch the latest available TradingView value through the same
+    websocket chart feed used by TradingView charts.
+
+    Why this exists:
+        Some chart-only / breadth symbols (for example INDEX:S5TW)
+        are visible on TradingView charts but are NOT returned by the
+        scanner HTTP endpoint.
+
+    Authentication:
+        Anonymous / unauthorized TradingView access is used.
+        TradingView may return delayed data for anonymous sessions.
+
+    Returns:
+        > 0     usable latest value
+        None    websocket could not provide a value
+    """
+
+    try:
+        from websockets.sync.client import (
+            connect,
+        )
+    except Exception as exc:
+
+        print(
+            f"{ticker}: TradingView websocket "
+            f"library unavailable ({exc})."
+        )
+
+        return None
+
+    quote_session = (
+        "qs_"
+        + secrets.token_hex(6)
+    )
+
+    chart_session = (
+        "cs_"
+        + secrets.token_hex(6)
+    )
+
+    symbol_alias = "symbol_1"
+    series_id = "s1"
+
+    symbol_spec = (
+        "="
+        + json.dumps(
+            {
+                "symbol": full_symbol,
+                "adjustment": "splits",
+            },
+            separators=(",", ":"),
+        )
+    )
+
+    uri = (
+        "wss://data.tradingview.com/"
+        "socket.io/websocket"
+    )
+
+    # Different TradingView deployments have accepted either of
+    # these browser-like origins.  Try both before giving up.
+    origins = [
+        "https://data.tradingview.com",
+        "https://www.tradingview.com",
+    ]
+
+    last_error = None
+
+    for origin in origins:
+
+        try:
+
+            with connect(
+                uri,
+                origin=origin,
+                user_agent_header=(
+                    TRADINGVIEW_HEADERS[
+                        "User-Agent"
+                    ]
+                ),
+                open_timeout=10,
+                close_timeout=3,
+                ping_interval=None,
+                max_size=2 * 1024 * 1024,
+            ) as websocket:
+
+                websocket.send(
+                    _tradingview_message(
+                        "set_auth_token",
+                        [
+                            "unauthorized_user_token"
+                        ],
+                    )
+                )
+
+                websocket.send(
+                    _tradingview_message(
+                        "quote_create_session",
+                        [quote_session],
+                    )
+                )
+
+                websocket.send(
+                    _tradingview_message(
+                        "quote_set_fields",
+                        [
+                            quote_session,
+                            "lp",
+                            "lp_time",
+                            "ch",
+                            "chp",
+                            "description",
+                            "exchange",
+                            "type",
+                            "update_mode",
+                            "rtc",
+                        ],
+                    )
+                )
+
+                websocket.send(
+                    _tradingview_message(
+                        "quote_add_symbols",
+                        [
+                            quote_session,
+                            full_symbol,
+                        ],
+                    )
+                )
+
+                websocket.send(
+                    _tradingview_message(
+                        "quote_fast_symbols",
+                        [
+                            quote_session,
+                            full_symbol,
+                        ],
+                    )
+                )
+
+                # Also request a chart series.  This is important for
+                # chart-only breadth indicators such as INDEX:S5TW,
+                # where the quote/scanner layer may not expose lp.
+                websocket.send(
+                    _tradingview_message(
+                        "chart_create_session",
+                        [
+                            chart_session,
+                            "",
+                        ],
+                    )
+                )
+
+                websocket.send(
+                    _tradingview_message(
+                        "resolve_symbol",
+                        [
+                            chart_session,
+                            symbol_alias,
+                            symbol_spec,
+                        ],
+                    )
+                )
+
+                # 1D is intentionally requested instead of 1-minute.
+                # The latest daily bar's close is the latest available
+                # value and is supported by more index/breadth symbols.
+                websocket.send(
+                    _tradingview_message(
+                        "create_series",
+                        [
+                            chart_session,
+                            series_id,
+                            series_id,
+                            symbol_alias,
+                            "1D",
+                            5,
+                        ],
+                    )
+                )
+
+                deadline = (
+                    time.monotonic()
+                    + 10
+                )
+
+                while (
+                    time.monotonic()
+                    < deadline
+                ):
+
+                    remaining = (
+                        deadline
+                        - time.monotonic()
+                    )
+
+                    try:
+                        message = websocket.recv(
+                            timeout=min(
+                                2,
+                                max(
+                                    0.1,
+                                    remaining,
+                                ),
+                            )
+                        )
+                    except TimeoutError:
+                        continue
+
+                    for raw_payload in (
+                        _split_tradingview_frames(
+                            message
+                        )
+                    ):
+
+                        # TradingView application heartbeat.
+                        if raw_payload.startswith(
+                            "~h~"
+                        ):
+
+                            websocket.send(
+                                _tradingview_raw_frame(
+                                    raw_payload
+                                )
+                            )
+
+                            continue
+
+                        try:
+                            payload = json.loads(
+                                raw_payload
+                            )
+                        except (
+                            TypeError,
+                            json.JSONDecodeError,
+                        ):
+                            continue
+
+                        price = (
+                            _extract_tradingview_price_from_payload(
+                                payload,
+                                full_symbol,
+                            )
+                        )
+
+                        if (
+                            price is not None
+                            and price > 0
+                        ):
+
+                            print(
+                                f"{ticker}: TradingView websocket "
+                                f"{full_symbol} -> ${price:.2f}"
+                            )
+
+                            return price
+
+                        method = payload.get(
+                            "m"
+                        )
+
+                        if method in {
+                            "symbol_error",
+                            "series_error",
+                            "critical_error",
+                        }:
+
+                            print(
+                                f"{ticker}: TradingView websocket "
+                                f"reported {method}."
+                            )
+
+                print(
+                    f"{ticker}: TradingView websocket "
+                    f"returned no usable value for "
+                    f"{full_symbol}."
+                )
+
+        except Exception as exc:
+
+            last_error = exc
+
+            print(
+                f"{ticker}: TradingView websocket "
+                f"connection failed with origin "
+                f"{origin} ({exc})."
+            )
+
+    if last_error is not None:
+
+        print(
+            f"{ticker}: TradingView websocket "
+            f"fallback exhausted ({last_error})."
+        )
+
+    return None
+
+
+def get_tradingview_scanner_price(
+    ticker,
+    full_symbol,
+):
+    """
+    First TradingView method: HTTP scanner.
+
+    This is quick for symbols exposed through TradingView's scanner,
+    but some chart-only indexes (including S5TW in current testing)
+    return no row.  In that case the websocket chart fallback is used.
+    """
 
     url = (
         "https://scanner.tradingview.com/"
@@ -541,6 +1060,12 @@ def get_tradingview_fallback_price(ticker):
         "Content-Type": (
             "application/json"
         ),
+        "Origin": (
+            "https://www.tradingview.com"
+        ),
+        "Referer": (
+            "https://www.tradingview.com/"
+        ),
     }
 
     try:
@@ -563,7 +1088,7 @@ def get_tradingview_fallback_price(ticker):
 
         if not rows:
             print(
-                f"{ticker}: TradingView returned "
+                f"{ticker}: TradingView scanner returned "
                 f"no quote for {full_symbol}."
             )
             return None
@@ -586,8 +1111,8 @@ def get_tradingview_fallback_price(ticker):
 
         if raw_price is None:
             print(
-                f"{ticker}: TradingView quote has "
-                f"no close value."
+                f"{ticker}: TradingView scanner quote "
+                f"has no close value."
             )
             return None
 
@@ -597,14 +1122,14 @@ def get_tradingview_fallback_price(ticker):
 
         if price <= 0:
             print(
-                f"{ticker}: TradingView returned "
+                f"{ticker}: TradingView scanner returned "
                 f"invalid price {price}."
             )
             return None
 
         print(
-            f"{ticker}: TradingView fallback "
-            f"{full_symbol} -> {price:.2f}"
+            f"{ticker}: TradingView scanner "
+            f"{full_symbol} -> ${price:.2f}"
         )
 
         return price
@@ -612,11 +1137,58 @@ def get_tradingview_fallback_price(ticker):
     except Exception as exc:
 
         print(
-            f"{ticker}: TradingView fallback failed "
+            f"{ticker}: TradingView scanner failed "
             f"({exc})"
         )
 
         return None
+
+
+def get_tradingview_fallback_price(ticker):
+    """
+    Get the latest available TradingView value for a ticker.
+
+    Order inside TradingView:
+        1. HTTP scanner (fast)
+        2. Websocket quote/chart feed (handles chart-only symbols)
+
+    This remains the SECOND PROVIDER after Yahoo.  It is called only
+    after Yahoo 1-minute and Yahoo daily fallback both fail.
+
+    Daily High / Daily Low are intentionally NOT populated from this
+    fallback.  Those fields keep the yfinance 1-minute definition and
+    remain unchanged when Yahoo intraday data is absent.
+    """
+
+    full_symbol = resolve_tradingview_symbol(
+        ticker
+    )
+
+    if not full_symbol:
+        return None
+
+    price = (
+        get_tradingview_scanner_price(
+            ticker,
+            full_symbol,
+        )
+    )
+
+    if (
+        price is not None
+        and price > 0
+    ):
+        return price
+
+    print(
+        f"{ticker}: TradingView scanner had no usable "
+        f"price; trying websocket chart feed..."
+    )
+
+    return get_tradingview_websocket_price(
+        ticker,
+        full_symbol,
+    )
 
 
 def get_secondary_fallback_price(ticker):
