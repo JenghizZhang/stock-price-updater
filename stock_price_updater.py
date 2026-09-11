@@ -61,6 +61,31 @@ READER_HEADERS = {
 
 
 # =========================================================
+# Secondary market-data fallback: TradingView
+# =========================================================
+#
+# Yahoo / yfinance remains the primary source.
+# TradingView is contacted ONLY when both Yahoo 1-minute data
+# and the existing Yahoo daily fallback fail for a ticker.
+#
+# Known TradingView-only symbols can be pinned here to avoid
+# an extra symbol-search request and to prevent ambiguity.
+TRADINGVIEW_SYMBOL_OVERRIDES = {
+    "S5TW": "INDEX:S5TW",
+}
+
+TRADINGVIEW_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Origin": "https://www.tradingview.com",
+    "Referer": "https://www.tradingview.com/",
+}
+
+
+# =========================================================
 # Notion: Stocks Price database
 # =========================================================
 
@@ -309,6 +334,311 @@ def verify_missing_ticker(ticker):
 
 
 
+
+def resolve_tradingview_symbol(ticker):
+    """
+    Resolve a plain ticker to TradingView's EXCHANGE:SYMBOL form.
+
+    Known overrides are used first.  For other Yahoo failures,
+    TradingView's symbol-search endpoint is queried and only an
+    EXACT symbol match is accepted.
+
+    Returns:
+        e.g. "INDEX:S5TW"
+
+    or:
+        None
+    """
+
+    ticker = ticker.strip().upper()
+
+    override = TRADINGVIEW_SYMBOL_OVERRIDES.get(ticker)
+
+    if override:
+        print(
+            f"{ticker}: TradingView override "
+            f"-> {override}"
+        )
+        return override
+
+    url = (
+        "https://symbol-search.tradingview.com/"
+        "symbol_search/v3/"
+    )
+
+    params = {
+        "text": ticker,
+        "hl": 1,
+        "lang": "en",
+        "search_type": "undefined",
+        "domain": "production",
+        "sort_by_country": "US",
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=TRADINGVIEW_HEADERS,
+            params=params,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+        candidates = payload.get(
+            "symbols",
+            [],
+        )
+
+        exact_matches = []
+
+        for item in candidates:
+
+            symbol = str(
+                item.get(
+                    "symbol",
+                    "",
+                )
+            ).strip().upper()
+
+            exchange = str(
+                item.get(
+                    "exchange",
+                    "",
+                )
+            ).strip().upper()
+
+            if (
+                symbol != ticker
+                or not exchange
+            ):
+                continue
+
+            score = 0
+
+            if str(
+                item.get(
+                    "country",
+                    "",
+                )
+            ).upper() == "US":
+                score += 100
+
+            if item.get(
+                "is_primary_listing"
+            ):
+                score += 50
+
+            if exchange in {
+                "INDEX",
+                "NASDAQ",
+                "NYSE",
+                "AMEX",
+                "ARCA",
+                "BATS",
+                "CBOE",
+                "OTC",
+            }:
+                score += 25
+
+            exact_matches.append(
+                (
+                    score,
+                    f"{exchange}:{symbol}",
+                )
+            )
+
+        if not exact_matches:
+            print(
+                f"{ticker}: TradingView symbol search "
+                f"found no exact match."
+            )
+            return None
+
+        exact_matches.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        resolved = exact_matches[0][1]
+
+        print(
+            f"{ticker}: TradingView symbol resolved "
+            f"-> {resolved}"
+        )
+
+        return resolved
+
+    except Exception as exc:
+
+        print(
+            f"{ticker}: TradingView symbol search failed "
+            f"({exc})"
+        )
+
+        return None
+
+
+def get_tradingview_fallback_price(ticker):
+    """
+    Get the latest available TradingView quote for a ticker.
+
+    This is the SECOND data-source fallback and is called only
+    after both Yahoo 1-minute data and Yahoo daily fallback fail.
+
+    For S5TW the pinned TradingView symbol is INDEX:S5TW.
+
+    Returns:
+        > 0     valid TradingView price
+        None    TradingView could not provide a usable quote
+
+    Daily High / Daily Low are intentionally NOT populated from
+    this fallback.  Those fields keep the existing yfinance 1-minute
+    definition and remain unchanged when Yahoo intraday data is absent.
+    """
+
+    full_symbol = resolve_tradingview_symbol(
+        ticker
+    )
+
+    if not full_symbol:
+        return None
+
+    url = (
+        "https://scanner.tradingview.com/"
+        "global/scan"
+    )
+
+    columns = [
+        "name",
+        "description",
+        "close",
+        "update_mode",
+    ]
+
+    payload = {
+        "symbols": {
+            "tickers": [
+                full_symbol
+            ],
+            "query": {
+                "types": []
+            },
+        },
+        "columns": columns,
+        "range": [0, 1],
+    }
+
+    scanner_headers = {
+        "User-Agent": (
+            TRADINGVIEW_HEADERS[
+                "User-Agent"
+            ]
+        ),
+        "Content-Type": (
+            "application/json"
+        ),
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers=scanner_headers,
+            json=payload,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        rows = data.get(
+            "data",
+            [],
+        )
+
+        if not rows:
+            print(
+                f"{ticker}: TradingView returned "
+                f"no quote for {full_symbol}."
+            )
+            return None
+
+        values = rows[0].get(
+            "d",
+            [],
+        )
+
+        row = dict(
+            zip(
+                columns,
+                values,
+            )
+        )
+
+        raw_price = row.get(
+            "close"
+        )
+
+        if raw_price is None:
+            print(
+                f"{ticker}: TradingView quote has "
+                f"no close value."
+            )
+            return None
+
+        price = float(
+            raw_price
+        )
+
+        if price <= 0:
+            print(
+                f"{ticker}: TradingView returned "
+                f"invalid price {price}."
+            )
+            return None
+
+        print(
+            f"{ticker}: TradingView fallback "
+            f"{full_symbol} -> {price:.2f}"
+        )
+
+        return price
+
+    except Exception as exc:
+
+        print(
+            f"{ticker}: TradingView fallback failed "
+            f"({exc})"
+        )
+
+        return None
+
+
+def get_secondary_fallback_price(ticker):
+    """
+    Secondary provider chain.
+
+    Currently:
+        TradingView
+
+    More non-Yahoo providers can be added here later without
+    changing the main price-download logic.
+    """
+
+    print(
+        f"{ticker}: trying secondary data source "
+        f"(TradingView)..."
+    )
+
+    return get_tradingview_fallback_price(
+        ticker
+    )
+
 def get_intraday_daily_range(
     ticker,
     ticker_data,
@@ -483,14 +813,22 @@ def get_intraday_daily_range(
 
 def get_prices(tickers):
     """
-    Download latest market prices.
+    Download latest market prices with a layered fallback chain.
+
+    Price priority:
+
+        1. Yahoo / yfinance 1-minute batch data
+        2. Yahoo / yfinance existing 1-day fallback
+        3. TradingView secondary fallback
+        4. Everything failed -> 0
 
     Returns:
         prices
         daily_ranges
 
-    daily_ranges is calculated from the same 1-minute batch data,
-    so no additional Yahoo request is needed.
+    Daily High / Daily Low are calculated ONLY from valid Yahoo
+    1-minute data.  Yahoo daily fallback and TradingView fallback
+    never fabricate or overwrite Daily High / Daily Low.
     """
 
     print(
@@ -508,6 +846,12 @@ def get_prices(tickers):
         for ticker in tickers
     }
 
+    data = None
+
+    # =====================================================
+    # 1. Yahoo 1-minute batch
+    # =====================================================
+
     try:
 
         data = yf.download(
@@ -524,37 +868,34 @@ def get_prices(tickers):
     except Exception as exc:
 
         print(
-            f"Yahoo batch request failed: {exc}"
+            f"Yahoo 1-minute batch request failed: {exc}"
         )
 
         print(
-            "Keeping all existing Notion prices "
-            "and Daily High/Low values."
-        )
-
-        return (
-            prices,
-            daily_ranges,
+            "Continuing with per-ticker Yahoo daily "
+            "fallback, then TradingView fallback."
         )
 
     for ticker in tickers:
 
         ticker_data = None
 
-        try:
+        if data is not None:
 
-            ticker_data = (
-                data[ticker]
-            )
+            try:
 
-        except Exception:
-            ticker_data = None
+                ticker_data = (
+                    data[ticker]
+                )
+
+            except Exception:
+                ticker_data = None
 
         # -------------------------------------------------
         # Daily High / Daily Low
         #
-        # Reuse the same 1-minute batch response.
-        # No second yfinance request.
+        # Reuse Yahoo's same 1-minute batch response.
+        # No second Yahoo intraday request.
         # -------------------------------------------------
 
         if ticker_data is not None:
@@ -567,7 +908,7 @@ def get_prices(tickers):
             )
 
         # -------------------------------------------------
-        # Current Price
+        # Current Price from Yahoo 1-minute data
         # -------------------------------------------------
 
         try:
@@ -588,8 +929,8 @@ def get_prices(tickers):
                     prices[ticker] = price
 
                     print(
-                        f"{ticker}: "
-                        f"${price:.2f}"
+                        f"{ticker}: Yahoo 1m "
+                        f"-> ${price:.2f}"
                     )
 
                     continue
@@ -597,27 +938,68 @@ def get_prices(tickers):
         except Exception:
             pass
 
-        # -------------------------------------------------
-        # Fallback
-        #
-        # Existing behavior is preserved:
-        # verify with 1-day bars.
-        #
-        # IMPORTANT:
-        # A 1-day fallback price does NOT overwrite Daily High/Low.
-        # Daily High/Low stays unchanged until valid 1-minute
-        # data is available again.
-        # -------------------------------------------------
+        # =================================================
+        # 2. Existing Yahoo daily fallback
+        # =================================================
 
         print(
-            f"{ticker}: batch price missing, "
-            f"verifying..."
+            f"{ticker}: Yahoo 1m price missing; "
+            f"trying Yahoo daily fallback..."
         )
 
-        prices[ticker] = (
+        yahoo_daily_price = (
             verify_missing_ticker(
                 ticker
             )
+        )
+
+        if (
+            yahoo_daily_price is not None
+            and yahoo_daily_price > 0
+        ):
+
+            prices[ticker] = (
+                yahoo_daily_price
+            )
+
+            print(
+                f"{ticker}: using Yahoo daily "
+                f"fallback -> "
+                f"${yahoo_daily_price:.2f}"
+            )
+
+            continue
+
+        # =================================================
+        # 3. Secondary provider fallback: TradingView
+        # =================================================
+
+        secondary_price = (
+            get_secondary_fallback_price(
+                ticker
+            )
+        )
+
+        if (
+            secondary_price is not None
+            and secondary_price > 0
+        ):
+
+            prices[ticker] = (
+                secondary_price
+            )
+
+            continue
+
+        # =================================================
+        # 4. Everything failed -> 0
+        # =================================================
+
+        prices[ticker] = 0.0
+
+        print(
+            f"{ticker}: all price sources failed "
+            f"-> $0"
         )
 
     return (
@@ -723,7 +1105,7 @@ def update_notion_price(
 
         print(
             f"Updated price {ticker}: "
-            f"INVALID TICKER -> $0"
+            f"NO PRICE DATA -> $0"
         )
 
     else:
