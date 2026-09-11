@@ -1571,8 +1571,17 @@ def create_stock_row(
     ticker,
 ):
     """
-    Create a new row in Stocks Price for a ticker discovered in
-    the 股票 page but missing from the database.
+    Create a new row in Stocks Price for a ticker-like heading
+    discovered in the 股票 page but missing from the database.
+
+    The row is created EVEN IF Yahoo Finance cannot provide a
+    price for that symbol.  This keeps Stocks Price complete and
+    makes unsupported / mistyped symbols visible to the user.
+
+    A newly-created row starts with Current Price = 0.  If market
+    data is available later in the same run, get_prices() will
+    overwrite 0 with the real price.  If the symbol is unsupported,
+    it remains 0 and can be spotted easily in Stocks Price.
 
     IMPORTANT:
 
@@ -1609,7 +1618,10 @@ def create_stock_row(
                         },
                     }
                 ]
-            }
+            },
+            "Current Price": {
+                "number": 0
+            },
         },
     }
 
@@ -1659,11 +1671,25 @@ def add_missing_note_tickers_to_stock_price(
     ticker_info,
 ):
     """
-    Find ticker headings in 股票 that are missing from Stocks
-    Price, validate them with Yahoo Finance, and create rows.
+    Find ticker-like headings in 股票 that are missing from
+    Stocks Price and create rows for ALL of them.
 
-    Invalid-looking or non-existent Yahoo symbols are NOT added.
-    Temporary Yahoo failures are deferred until the next run.
+    IMPORTANT:
+
+    We intentionally do NOT validate the symbol with Yahoo Finance
+    before creating the row.
+
+    Why:
+        - TradingView-only symbols such as S5TW may not exist in
+          Yahoo Finance.
+        - A mistyped / unsupported ticker should still appear in
+          Stocks Price so the user can see it and fix it.
+        - Unsupported symbols will normally end up with
+          Current Price = 0.
+
+    Chinese/category headings are still ignored by
+    discover_ticker_headings(), so headings such as 高估股票 or
+    ————半导体个股———— are not added as tickers.
     """
 
     discovered = (
@@ -1695,33 +1721,9 @@ def add_missing_note_tickers_to_stock_price(
     for ticker in missing:
 
         print(
-            f"Validating missing ticker {ticker}..."
+            f"Adding missing ticker {ticker} "
+            f"to Stocks Price without Yahoo validation..."
         )
-
-        validation_price = (
-            verify_missing_ticker(
-                ticker
-            )
-        )
-
-        if validation_price is None:
-
-            print(
-                f"{ticker}: temporary Yahoo failure; "
-                f"automatic row creation deferred."
-            )
-
-            continue
-
-        if validation_price <= 0:
-
-            print(
-                f"{ticker}: ticker heading was found, "
-                f"but Yahoo did not validate it; "
-                f"not adding it to Stocks Price."
-            )
-
-            continue
 
         page = (
             create_stock_row(
@@ -1736,7 +1738,7 @@ def add_missing_note_tickers_to_stock_price(
         ticker_info[ticker] = {
             "page_id": page["id"],
             "last_alert_range": "",
-            "previous_price": None,
+            "previous_price": 0.0,
         }
 
 
@@ -3317,8 +3319,12 @@ def main():
     #
     #     but JPM is not yet in Stocks Price.
     #
-    # The program validates JPM with Yahoo Finance and then
-    # creates a new Stocks Price row automatically.
+    # The program creates a new Stocks Price row automatically
+    # WITHOUT requiring Yahoo Finance validation first.
+    #
+    # This is intentional: TradingView-only or unsupported symbols
+    # such as S5TW should still appear in Stocks Price, usually with
+    # Current Price = 0, so missing / unsupported tickers are visible.
     #
     # Chinese/category headings are ignored, including:
     #
