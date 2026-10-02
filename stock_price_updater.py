@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import math
 import secrets
 import time
 from datetime import datetime
@@ -85,6 +86,47 @@ TRADINGVIEW_HEADERS = {
     ),
     "Origin": "https://www.tradingview.com",
     "Referer": "https://www.tradingview.com/",
+}
+
+
+# =========================================================
+# ERP / fundamentals
+# =========================================================
+#
+# ERP here is an earnings-yield spread proxy:
+#
+#     Earnings Yield = EPS / Current Price
+#     ERP = Earnings Yield - US 10Y Treasury Yield
+#
+# Fundamental-source priority:
+#
+#     1. Forward EPS
+#     2. Forward PE  -> derive implied EPS = price / PE
+#     3. Trailing EPS
+#     4. Trailing PE -> derive implied EPS = price / PE
+#
+# The fundamental snapshot is refreshed at most once every 24 hours.
+# To avoid a large burst of Yahoo fundamental requests, only a limited
+# number of stale rows are refreshed in each workflow run.  Rows that
+# are not refreshed yet keep their existing Notion values.
+TEN_YEAR_YIELD_TICKER = "^TNX"
+
+FUNDAMENTAL_REFRESH_HOURS = 24
+FUNDAMENTAL_REFRESH_BATCH_SIZE = 20
+
+FUNDAMENTAL_SOURCE_TYPES = {
+    "Forward EPS",
+    "Forward PE",
+    "Trailing EPS",
+    "Trailing PE",
+}
+
+# These symbols do not have a meaningful company/portfolio earnings
+# yield for this ERP calculation.
+ERP_NOT_APPLICABLE_TICKERS = {
+    "S5TW",
+    "^VIX",
+    "^TNX",
 }
 
 
@@ -253,6 +295,97 @@ def get_current_price(page):
         ValueError,
     ):
         return None
+
+
+def get_number_property(
+    page,
+    property_name,
+):
+    """
+    Read a Number property from a Stocks Price row.
+    """
+
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
+    )
+
+    if not prop:
+        return None
+
+    value = prop.get("number")
+
+    if value is None:
+        return None
+
+    try:
+        value = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if not math.isfinite(value):
+        return None
+
+    return value
+
+
+def get_select_property_name(
+    page,
+    property_name,
+):
+    """
+    Read a Select property's option name.
+    """
+
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
+    )
+
+    if not prop:
+        return None
+
+    option = prop.get("select")
+
+    if not option:
+        return None
+
+    name = str(
+        option.get("name", "")
+    ).strip()
+
+    return name or None
+
+
+def get_date_property_start(
+    page,
+    property_name,
+):
+    """
+    Read a Date property's start timestamp.
+    """
+
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
+    )
+
+    if not prop:
+        return None
+
+    date_value = prop.get("date")
+
+    if not date_value:
+        return None
+
+    start = str(
+        date_value.get("start", "")
+    ).strip()
+
+    return start or None
 
 
 # =========================================================
@@ -1383,6 +1516,75 @@ def get_intraday_daily_range(
         return None
 
 
+def normalize_ten_year_yield(raw_value):
+    """
+    Yahoo's ^TNX quote is expressed in percentage points.
+
+    Example:
+        ^TNX = 4.25
+        -> 10Y Yield = 0.0425
+        -> Notion Percent displays 4.25%
+    """
+
+    try:
+        value = float(raw_value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if (
+        not math.isfinite(value)
+        or value <= 0
+        or value >= 25
+    ):
+        return None
+
+    return value / 100.0
+
+
+def get_ten_year_yield_from_batch(data):
+    """
+    Read the latest ^TNX close from the existing Yahoo 1-minute batch.
+    """
+
+    if data is None:
+        return None
+
+    try:
+
+        close = (
+            data[
+                TEN_YEAR_YIELD_TICKER
+            ]["Close"]
+            .dropna()
+        )
+
+        if close.empty:
+            return None
+
+        raw_value = float(
+            close.iloc[-1]
+        )
+
+        result = normalize_ten_year_yield(
+            raw_value
+        )
+
+        if result is not None:
+
+            print(
+                f"{TEN_YEAR_YIELD_TICKER}: Yahoo 1m "
+                f"10Y yield -> {result * 100:.3f}%"
+            )
+
+        return result
+
+    except Exception:
+        return None
+
+
 def get_prices(tickers):
     """
     Download latest market prices with a layered fallback chain.
@@ -1394,9 +1596,13 @@ def get_prices(tickers):
         3. TradingView secondary fallback
         4. Everything failed -> 0
 
+    The same Yahoo 1-minute batch also requests ^TNX once so the
+    current US 10-year Treasury yield can be reused for every ticker.
+
     Returns:
         prices
         daily_ranges
+        ten_year_yield
 
     Daily High / Daily Low are calculated ONLY from valid Yahoo
     1-minute data.  Yahoo daily fallback and TradingView fallback
@@ -1420,6 +1626,13 @@ def get_prices(tickers):
 
     data = None
 
+    download_tickers = list(
+        dict.fromkeys(
+            list(tickers)
+            + [TEN_YEAR_YIELD_TICKER]
+        )
+    )
+
     # =====================================================
     # 1. Yahoo 1-minute batch
     # =====================================================
@@ -1427,7 +1640,7 @@ def get_prices(tickers):
     try:
 
         data = yf.download(
-            tickers=tickers,
+            tickers=download_tickers,
             period="5d",
             interval="1m",
             group_by="ticker",
@@ -1447,6 +1660,50 @@ def get_prices(tickers):
             "Continuing with per-ticker Yahoo daily "
             "fallback, then TradingView fallback."
         )
+
+    # -----------------------------------------------------
+    # US 10Y Treasury yield
+    # -----------------------------------------------------
+
+    ten_year_yield = (
+        get_ten_year_yield_from_batch(
+            data
+        )
+    )
+
+    if ten_year_yield is None:
+
+        print(
+            f"{TEN_YEAR_YIELD_TICKER}: 1m yield missing; "
+            f"trying Yahoo daily fallback..."
+        )
+
+        raw_tnx = (
+            verify_missing_ticker(
+                TEN_YEAR_YIELD_TICKER
+            )
+        )
+
+        ten_year_yield = (
+            normalize_ten_year_yield(
+                raw_tnx
+            )
+        )
+
+        if ten_year_yield is not None:
+
+            print(
+                f"{TEN_YEAR_YIELD_TICKER}: Yahoo daily "
+                f"10Y yield -> "
+                f"{ten_year_yield * 100:.3f}%"
+            )
+
+        else:
+
+            print(
+                f"{TEN_YEAR_YIELD_TICKER}: unable to "
+                f"retrieve a usable 10Y yield."
+            )
 
     for ticker in tickers:
 
@@ -1577,7 +1834,587 @@ def get_prices(tickers):
     return (
         prices,
         daily_ranges,
+        ten_year_yield,
     )
+
+
+# =========================================================
+# Fundamentals / ERP
+# =========================================================
+
+def safe_finite_number(value):
+    """
+    Convert a Yahoo fundamental value to a finite float.
+
+    Negative EPS is valid and therefore intentionally allowed.
+    """
+
+    if value is None:
+        return None
+
+    try:
+        number = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if not math.isfinite(number):
+        return None
+
+    return number
+
+
+def parse_notion_datetime(value):
+    """
+    Parse a Notion ISO date/timestamp.
+    """
+
+    if not value:
+        return None
+
+    try:
+
+        parsed = datetime.fromisoformat(
+            str(value).replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        if parsed.tzinfo is None:
+
+            parsed = parsed.replace(
+                tzinfo=ZoneInfo(
+                    "America/Los_Angeles"
+                )
+            )
+
+        return parsed
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def fundamental_refresh_due(updated_at):
+    """
+    Return True when the cached fundamental snapshot is at least
+    FUNDAMENTAL_REFRESH_HOURS old, or has never been checked.
+    """
+
+    parsed = parse_notion_datetime(
+        updated_at
+    )
+
+    if parsed is None:
+        return True
+
+    now = datetime.now(
+        ZoneInfo(
+            "America/Los_Angeles"
+        )
+    )
+
+    age_seconds = (
+        now
+        - parsed.astimezone(
+            now.tzinfo
+        )
+    ).total_seconds()
+
+    if age_seconds < 0:
+        return False
+
+    return (
+        age_seconds
+        >= FUNDAMENTAL_REFRESH_HOURS
+        * 3600
+    )
+
+
+def fundamental_now_iso():
+    """
+    Timestamp used for Fundamental Updated.
+    """
+
+    return datetime.now(
+        ZoneInfo(
+            "America/Los_Angeles"
+        )
+    ).isoformat()
+
+
+def ticker_erp_is_applicable(ticker):
+    """
+    Explicit exclusions for symbols where company/portfolio earnings
+    yield is not a meaningful ERP input.
+    """
+
+    return (
+        ticker.upper()
+        not in ERP_NOT_APPLICABLE_TICKERS
+    )
+
+
+def fetch_yahoo_fundamental_snapshot(
+    ticker,
+    current_price,
+):
+    """
+    Fetch one ticker's earnings basis from Yahoo.
+
+    Priority:
+        1. Forward EPS
+        2. Forward PE  -> implied EPS = current price / PE
+        3. Trailing EPS
+        4. Trailing PE -> implied EPS = current price / PE
+
+    Returns a dict with status:
+        ok
+        no_data
+        not_applicable
+        error
+    """
+
+    ticker = ticker.upper()
+
+    if not ticker_erp_is_applicable(
+        ticker
+    ):
+
+        print(
+            f"{ticker}: ERP fundamentals are "
+            f"not applicable."
+        )
+
+        return {
+            "status": "not_applicable",
+            "eps": None,
+            "eps_type": None,
+        }
+
+    try:
+
+        stock = yf.Ticker(
+            ticker
+        )
+
+        info = stock.get_info()
+
+        if not isinstance(
+            info,
+            dict,
+        ):
+
+            info = {}
+
+    except Exception as exc:
+
+        print(
+            f"{ticker}: fundamental refresh failed "
+            f"({exc})."
+        )
+
+        return {
+            "status": "error",
+            "eps": None,
+            "eps_type": None,
+        }
+
+    forward_eps = (
+        safe_finite_number(
+            info.get(
+                "forwardEps"
+            )
+        )
+    )
+
+    if forward_eps is not None:
+
+        print(
+            f"{ticker}: fundamental source "
+            f"Forward EPS -> {forward_eps:.4f}"
+        )
+
+        return {
+            "status": "ok",
+            "eps": forward_eps,
+            "eps_type": "Forward EPS",
+        }
+
+    forward_pe = (
+        safe_finite_number(
+            info.get(
+                "forwardPE"
+            )
+        )
+    )
+
+    if (
+        forward_pe is not None
+        and forward_pe > 0
+        and current_price is not None
+        and current_price > 0
+    ):
+
+        implied_eps = (
+            float(current_price)
+            / forward_pe
+        )
+
+        print(
+            f"{ticker}: fundamental source "
+            f"Forward PE {forward_pe:.4f} "
+            f"-> implied EPS {implied_eps:.4f}"
+        )
+
+        return {
+            "status": "ok",
+            "eps": implied_eps,
+            "eps_type": "Forward PE",
+        }
+
+    trailing_eps = (
+        safe_finite_number(
+            info.get(
+                "trailingEps"
+            )
+        )
+    )
+
+    if trailing_eps is not None:
+
+        print(
+            f"{ticker}: fundamental source "
+            f"Trailing EPS -> {trailing_eps:.4f}"
+        )
+
+        return {
+            "status": "ok",
+            "eps": trailing_eps,
+            "eps_type": "Trailing EPS",
+        }
+
+    trailing_pe = (
+        safe_finite_number(
+            info.get(
+                "trailingPE"
+            )
+        )
+    )
+
+    if (
+        trailing_pe is not None
+        and trailing_pe > 0
+        and current_price is not None
+        and current_price > 0
+    ):
+
+        implied_eps = (
+            float(current_price)
+            / trailing_pe
+        )
+
+        print(
+            f"{ticker}: fundamental source "
+            f"Trailing PE {trailing_pe:.4f} "
+            f"-> implied EPS {implied_eps:.4f}"
+        )
+
+        return {
+            "status": "ok",
+            "eps": implied_eps,
+            "eps_type": "Trailing PE",
+        }
+
+    print(
+        f"{ticker}: Yahoo returned no usable "
+        f"Forward/Trailing EPS or PE."
+    )
+
+    return {
+        "status": "no_data",
+        "eps": None,
+        "eps_type": None,
+    }
+
+
+def prepare_fundamental_snapshots(
+    ticker_info,
+    prices,
+):
+    """
+    Build the fundamental snapshot used by this run.
+
+    Existing Notion values act as the cross-run cache.
+
+    To reduce Yahoo request volume, only
+    FUNDAMENTAL_REFRESH_BATCH_SIZE stale tickers are refreshed in
+    one workflow run.  Because the action runs repeatedly, a first
+    deployment with many blank rows fills in progressively.
+
+    A successful refresh or a confirmed "no data" result updates
+    Fundamental Updated.  A transient request exception preserves
+    the old cached values and old timestamp so it can be retried.
+    """
+
+    snapshots = {}
+    refresh_candidates = []
+
+    for ticker, info in (
+        ticker_info.items()
+    ):
+
+        eps = info.get(
+            "eps"
+        )
+
+        eps_type = info.get(
+            "eps_type"
+        )
+
+        updated_at = info.get(
+            "fundamental_updated"
+        )
+
+        applicable = (
+            ticker_erp_is_applicable(
+                ticker
+            )
+        )
+
+        snapshots[ticker] = {
+            "applicable": applicable,
+            "eps": eps,
+            "eps_type": eps_type,
+            "updated_at": updated_at,
+            "refreshed": False,
+        }
+
+        if not applicable:
+
+            if (
+                eps is not None
+                or eps_type is not None
+                or fundamental_refresh_due(
+                    updated_at
+                )
+            ):
+
+                snapshots[ticker] = {
+                    "applicable": False,
+                    "eps": None,
+                    "eps_type": None,
+                    "updated_at": (
+                        fundamental_now_iso()
+                    ),
+                    "refreshed": True,
+                }
+
+            continue
+
+        if fundamental_refresh_due(
+            updated_at
+        ):
+
+            refresh_candidates.append(
+                ticker
+            )
+
+    if refresh_candidates:
+
+        print(
+            "Fundamental refresh candidates: "
+            + ", ".join(
+                refresh_candidates
+            )
+        )
+
+    refresh_now = (
+        refresh_candidates[
+            :FUNDAMENTAL_REFRESH_BATCH_SIZE
+        ]
+    )
+
+    if (
+        len(refresh_candidates)
+        > len(refresh_now)
+    ):
+
+        print(
+            f"Refreshing {len(refresh_now)} of "
+            f"{len(refresh_candidates)} stale "
+            f"fundamentals this run; remaining "
+            f"rows will be handled by later runs."
+        )
+
+    for ticker in refresh_now:
+
+        result = (
+            fetch_yahoo_fundamental_snapshot(
+                ticker,
+                prices.get(
+                    ticker
+                ),
+            )
+        )
+
+        status = result.get(
+            "status"
+        )
+
+        if status == "error":
+
+            print(
+                f"{ticker}: keeping cached "
+                f"fundamental values after "
+                f"temporary refresh failure."
+            )
+
+            continue
+
+        snapshots[ticker] = {
+            "applicable": (
+                status != "not_applicable"
+            ),
+            "eps": result.get(
+                "eps"
+            ),
+            "eps_type": result.get(
+                "eps_type"
+            ),
+            "updated_at": (
+                fundamental_now_iso()
+            ),
+            "refreshed": True,
+        }
+
+    return snapshots
+
+
+def build_valuation_snapshot(
+    ticker,
+    current_price,
+    fundamental,
+    ten_year_yield,
+):
+    """
+    Calculate Earnings Yield and ERP for one ticker.
+
+    Number values are decimal fractions:
+        0.0432 -> 4.32% in a Notion Percent field.
+    """
+
+    if not fundamental:
+        return None
+
+    if not fundamental.get(
+        "applicable",
+        True,
+    ):
+        return None
+
+    eps = fundamental.get(
+        "eps"
+    )
+
+    eps_type = fundamental.get(
+        "eps_type"
+    )
+
+    if (
+        eps is None
+        or not eps_type
+        or current_price is None
+        or current_price <= 0
+    ):
+        return None
+
+    try:
+
+        earnings_yield = (
+            float(eps)
+            / float(current_price)
+        )
+
+    except (
+        TypeError,
+        ValueError,
+        ZeroDivisionError,
+    ):
+        return None
+
+    if not math.isfinite(
+        earnings_yield
+    ):
+        return None
+
+    erp = None
+
+    if ten_year_yield is not None:
+
+        erp = (
+            earnings_yield
+            - float(
+                ten_year_yield
+            )
+        )
+
+        if not math.isfinite(erp):
+            erp = None
+
+    return {
+        "ticker": ticker,
+        "eps": float(eps),
+        "eps_type": eps_type,
+        "earnings_yield": (
+            earnings_yield
+        ),
+        "ten_year_yield": (
+            ten_year_yield
+        ),
+        "erp": erp,
+    }
+
+
+def build_all_valuations(
+    ticker_info,
+    prices,
+    fundamentals,
+    ten_year_yield,
+):
+    """
+    Calculate valuation/ERP snapshots for every ticker.
+    """
+
+    valuations = {}
+
+    for ticker in ticker_info:
+
+        valuations[ticker] = (
+            build_valuation_snapshot(
+                ticker=ticker,
+                current_price=(
+                    prices.get(
+                        ticker
+                    )
+                ),
+                fundamental=(
+                    fundamentals.get(
+                        ticker
+                    )
+                ),
+                ten_year_yield=(
+                    ten_year_yield
+                ),
+            )
+        )
+
+    return valuations
 
 
 def update_notion_price(
@@ -1585,6 +2422,9 @@ def update_notion_price(
     ticker,
     price,
     daily_range=None,
+    fundamental=None,
+    valuation=None,
+    ten_year_yield=None,
 ):
     """
     Update Stocks Price in ONE Notion PATCH.
@@ -1593,13 +2433,18 @@ def update_notion_price(
         Current Price
         Last Updated
 
-    When today's 1-minute range is available, the SAME PATCH
-    also updates:
+    When available, the SAME PATCH also updates:
         Daily High
         Daily Low
         Daily Range Date
+        EPS
+        EPS Type
+        Earnings Yield
+        10Y Yield
+        ERP
+        Fundamental Updated
 
-    This keeps the Notion API request count the same as before.
+    This keeps the per-ticker Notion write count at one PATCH.
     """
 
     now = datetime.now(
@@ -1655,6 +2500,125 @@ def update_notion_price(
             }
         }
 
+    # -----------------------------------------------------
+    # 10Y Yield
+    #
+    # Notion's field is formatted as Percent, so write the
+    # decimal fraction (4.25% -> 0.0425).
+    # -----------------------------------------------------
+
+    if ten_year_yield is not None:
+
+        properties[
+            "10Y Yield"
+        ] = {
+            "number": float(
+                ten_year_yield
+            )
+        }
+
+    # -----------------------------------------------------
+    # Fundamental cache fields
+    # -----------------------------------------------------
+
+    if fundamental is not None:
+
+        eps = fundamental.get(
+            "eps"
+        )
+
+        eps_type = fundamental.get(
+            "eps_type"
+        )
+
+        updated_at = fundamental.get(
+            "updated_at"
+        )
+
+        properties["EPS"] = {
+            "number": (
+                float(eps)
+                if eps is not None
+                else None
+            )
+        }
+
+        properties[
+            "EPS Type"
+        ] = {
+            "select": (
+                {
+                    "name": eps_type
+                }
+                if eps_type
+                else None
+            )
+        }
+
+        if updated_at:
+
+            properties[
+                "Fundamental Updated"
+            ] = {
+                "date": {
+                    "start": updated_at
+                }
+            }
+
+        # If there is no usable earnings basis, explicitly clear
+        # the valuation fields so stale ERP values do not linger.
+        if (
+            eps is None
+            or not eps_type
+            or not fundamental.get(
+                "applicable",
+                True,
+            )
+        ):
+
+            properties[
+                "Earnings Yield"
+            ] = {
+                "number": None
+            }
+
+            properties[
+                "ERP"
+            ] = {
+                "number": None
+            }
+
+    # -----------------------------------------------------
+    # Current Earnings Yield / ERP
+    #
+    # EPS is cached, but these values are recalculated every run
+    # using the latest current price and latest available 10Y yield.
+    # -----------------------------------------------------
+
+    if valuation is not None:
+
+        properties[
+            "Earnings Yield"
+        ] = {
+            "number": float(
+                valuation[
+                    "earnings_yield"
+                ]
+            )
+        }
+
+        erp = valuation.get(
+            "erp"
+        )
+
+        properties["ERP"] = {
+            "number": (
+                float(erp)
+                if erp is not None
+                else None
+            )
+        }
+
     payload = {
         "properties": properties
     }
@@ -1695,6 +2659,25 @@ def update_notion_price(
                 f"low=${daily_range['low']:.2f}, "
                 f"date={daily_range['date']}"
             )
+
+    if valuation is not None:
+
+        erp = valuation.get(
+            "erp"
+        )
+
+        erp_text = (
+            f"{erp * 100:.2f}%"
+            if erp is not None
+            else "(no 10Y yield)"
+        )
+
+        print(
+            f"{ticker}: Earnings Yield="
+            f"{valuation['earnings_yield'] * 100:.2f}%, "
+            f"ERP={erp_text}, "
+            f"source={valuation['eps_type']}"
+        )
 
 
 # =========================================================
@@ -2693,6 +3676,10 @@ def add_missing_note_tickers_to_stock_price(
             "page_id": page["id"],
             "last_alert_range": "",
             "previous_price": 0.0,
+            "eps": None,
+            "eps_type": None,
+            "fundamental_updated": None,
+            "ten_year_yield": None,
         }
 
 
@@ -3333,6 +4320,78 @@ def build_daily_range_text(
         return ""
 
 
+def build_erp_text(
+    valuation,
+):
+    """
+    Build the ERP block shown in alert comments.
+
+    Example:
+
+        ERP：-1.42%
+        Earnings Yield：2.68%
+        10Y Yield：4.10%
+        依据：Forward EPS 8.73
+    """
+
+    if not valuation:
+        return ""
+
+    earnings_yield = valuation.get(
+        "earnings_yield"
+    )
+
+    ten_year_yield = valuation.get(
+        "ten_year_yield"
+    )
+
+    erp = valuation.get(
+        "erp"
+    )
+
+    eps = valuation.get(
+        "eps"
+    )
+
+    eps_type = valuation.get(
+        "eps_type"
+    )
+
+    if (
+        earnings_yield is None
+        or ten_year_yield is None
+        or erp is None
+        or eps is None
+        or not eps_type
+    ):
+        return ""
+
+    if eps_type in {
+        "Forward PE",
+        "Trailing PE",
+    }:
+
+        basis_text = (
+            f"{eps_type}"
+            f"（隐含 EPS {eps:.2f}）"
+        )
+
+    else:
+
+        basis_text = (
+            f"{eps_type} {eps:.2f}"
+        )
+
+    return (
+        f"ERP：{erp * 100:+.2f}%\n"
+        f"Earnings Yield："
+        f"{earnings_yield * 100:.2f}%\n"
+        f"10Y Yield："
+        f"{ten_year_yield * 100:.2f}%\n"
+        f"依据：{basis_text}"
+    )
+
+
 def build_alert_message(
     ticker,
     price,
@@ -3340,9 +4399,16 @@ def build_alert_message(
     state,
     alerts,
     daily_range=None,
+    valuation=None,
 ):
     """
     Build user-facing alert message.
+
+    Order:
+        1. Price / alert-state change
+        2. Daily High / Daily Low context
+        3. ERP context
+        4. Full alert-range list
     """
 
     price_text = (
@@ -3496,6 +4562,12 @@ def build_alert_message(
         )
     )
 
+    erp_text = (
+        build_erp_text(
+            valuation
+        )
+    )
+
     message_parts = [
         f"{icon} {headline}"
     ]
@@ -3504,6 +4576,12 @@ def build_alert_message(
 
         message_parts.append(
             daily_range_text
+        )
+
+    if erp_text:
+
+        message_parts.append(
+            erp_text
         )
 
     message_parts.append(
@@ -3868,6 +4946,7 @@ def process_alert_states(
     ticker_info,
     prices,
     daily_ranges,
+    valuations,
     alerts_by_ticker,
     ticker_heading_ids,
 ):
@@ -4070,6 +5149,11 @@ def process_alert_states(
                         ticker
                     )
                 ),
+                valuation=(
+                    valuations.get(
+                        ticker
+                    )
+                ),
             )
         )
 
@@ -4203,6 +5287,9 @@ def main():
     #
     # Therefore previous_price represents the previous
     # program run.
+    #
+    # Fundamental fields are also read here so Notion acts
+    # as the persistent cache between GitHub Action runs.
     # -----------------------------------------------------
 
     data_source_id = (
@@ -4247,6 +5334,34 @@ def main():
                     page
                 )
             ),
+
+            "eps": (
+                get_number_property(
+                    page,
+                    "EPS",
+                )
+            ),
+
+            "eps_type": (
+                get_select_property_name(
+                    page,
+                    "EPS Type",
+                )
+            ),
+
+            "fundamental_updated": (
+                get_date_property_start(
+                    page,
+                    "Fundamental Updated",
+                )
+            ),
+
+            "ten_year_yield": (
+                get_number_property(
+                    page,
+                    "10Y Yield",
+                )
+            ),
         }
 
     # -----------------------------------------------------
@@ -4265,14 +5380,6 @@ def main():
     # 3. Automatically add missing ticker headings
     # -----------------------------------------------------
     #
-    # Example:
-    #
-    #     A new heading appears in 股票:
-    #
-    #         JPM 小摩
-    #
-    #     but JPM is not yet in Stocks Price.
-    #
     # The program creates a new Stocks Price row automatically
     # WITHOUT requiring Yahoo Finance validation first.
     #
@@ -4280,15 +5387,7 @@ def main():
     # such as S5TW should still appear in Stocks Price, usually with
     # Current Price = 0, so missing / unsupported tickers are visible.
     #
-    # Chinese/category headings are ignored, including:
-    #
-    #     ————半导体个股————
-    #     高估股票
-    #     正价股票
-    #     低估股票
-    #
-    # ^GSPC标普500（参考） is preserved because it STARTS
-    # with a real ticker code: ^GSPC.
+    # Chinese/category headings are ignored.
     # -----------------------------------------------------
 
     add_missing_note_tickers_to_stock_price(
@@ -4309,20 +5408,79 @@ def main():
     )
 
     # -----------------------------------------------------
-    # 4. Download latest prices
+    # 4. Download latest prices + US 10Y yield
     # -----------------------------------------------------
 
     (
         prices,
         daily_ranges,
+        ten_year_yield,
     ) = get_prices(
         tickers
     )
 
+    # If ^TNX temporarily fails, reuse the most recently stored
+    # 10Y Yield from Stocks Price rather than blanking every ERP.
+    if ten_year_yield is None:
+
+        stored_yields = [
+            info.get(
+                "ten_year_yield"
+            )
+            for info in ticker_info.values()
+            if (
+                info.get(
+                    "ten_year_yield"
+                )
+                is not None
+            )
+        ]
+
+        if stored_yields:
+
+            ten_year_yield = float(
+                stored_yields[0]
+            )
+
+            print(
+                "Using stored Notion 10Y Yield "
+                f"fallback -> "
+                f"{ten_year_yield * 100:.3f}%"
+            )
+
     # -----------------------------------------------------
-    # 5. Update Stocks Price
+    # 5. Refresh/cache fundamentals + calculate ERP
+    #
+    # Fundamentals are refreshed at most once every 24h and
+    # only a limited batch is refreshed per workflow run.
+    #
+    # Earnings Yield / ERP are then recalculated from the latest
+    # price every run using the cached EPS basis.
+    # -----------------------------------------------------
+
+    fundamentals = (
+        prepare_fundamental_snapshots(
+            ticker_info,
+            prices,
+        )
+    )
+
+    valuations = (
+        build_all_valuations(
+            ticker_info,
+            prices,
+            fundamentals,
+            ten_year_yield,
+        )
+    )
+
+    # -----------------------------------------------------
+    # 6. Update Stocks Price
     #
     # previous_price has already been saved in memory.
+    #
+    # Current Price, daily range, fundamentals and ERP are written
+    # in the SAME per-ticker Notion PATCH.
     # -----------------------------------------------------
 
     for ticker in tickers:
@@ -4354,10 +5512,23 @@ def main():
                     ticker
                 )
             ),
+            fundamental=(
+                fundamentals.get(
+                    ticker
+                )
+            ),
+            valuation=(
+                valuations.get(
+                    ticker
+                )
+            ),
+            ten_year_yield=(
+                ten_year_yield
+            ),
         )
 
     # -----------------------------------------------------
-    # 6. Read @alert + remember ticker heading IDs
+    # 7. Read @alert + remember ticker heading IDs
     # -----------------------------------------------------
 
     (
@@ -4397,13 +5568,14 @@ def main():
     print("")
 
     # -----------------------------------------------------
-    # 7. Check states + send @mention notifications
+    # 8. Check states + send @mention notifications
     # -----------------------------------------------------
 
     process_alert_states(
         ticker_info,
         prices,
         daily_ranges,
+        valuations,
         alerts_by_ticker,
         ticker_heading_ids,
     )
