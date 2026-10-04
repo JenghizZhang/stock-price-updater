@@ -95,26 +95,45 @@ TRADINGVIEW_HEADERS = {
 #
 # ERP here is an earnings-yield spread proxy:
 #
-#     Earnings Yield = EPS / Current Price
+#     Earnings Yield = selected EPS / Current Price
 #     ERP = Earnings Yield - US 10Y Treasury Yield
 #
-# Fundamental-source priority:
+# We keep three EPS views in Notion:
 #
-#     1. Forward EPS
-#     2. Forward PE  -> derive implied EPS = price / PE
-#     3. Trailing EPS
-#     4. Trailing PE -> derive implied EPS = price / PE
+#     TTM EPS  = trailing twelve-month EPS
+#     NTM EPS  = calendarized next-twelve-month EPS estimate
+#     +1Y EPS  = next full fiscal-year analyst EPS estimate
+#
+# NTM is estimated from Yahoo's annual analyst estimates:
+#
+#     NTM EPS ~= 0Y EPS * remaining-current-FY weight
+#               + +1Y EPS * next-FY weight
+#
+# The weight is based on the company's upcoming fiscal year end.
+# ERP basis priority:
+#
+#     1. NTM
+#     2. +1Y
+#     3. TTM
 #
 # The fundamental snapshot is refreshed at most once every 24 hours.
 # To avoid a large burst of Yahoo fundamental requests, only a limited
-# number of stale rows are refreshed in each workflow run.  Rows that
+# number of stale rows are refreshed in each workflow run. Rows that
 # are not refreshed yet keep their existing Notion values.
 TEN_YEAR_YIELD_TICKER = "^TNX"
 
 FUNDAMENTAL_REFRESH_HOURS = 24
 FUNDAMENTAL_REFRESH_BATCH_SIZE = 20
 
-FUNDAMENTAL_SOURCE_TYPES = {
+ERP_EPS_TYPES = {
+    "NTM",
+    "+1Y",
+    "TTM",
+}
+
+# Old values are used only to detect/migrate rows written by the
+# previous Forward-EPS implementation.
+LEGACY_ERP_EPS_TYPES = {
     "Forward EPS",
     "Forward PE",
     "Trailing EPS",
@@ -1960,18 +1979,331 @@ def ticker_erp_is_applicable(ticker):
     )
 
 
+def parse_yahoo_date(value):
+    """
+    Convert a Yahoo date-like value to a date.
+
+    Yahoo info normally exposes fiscal-year dates as Unix timestamps,
+    but this helper also accepts datetime/date-like and ISO strings so
+    a future yfinance representation change does not break NTM logic.
+    """
+
+    if value is None:
+        return None
+
+    if hasattr(value, "date"):
+        try:
+            return value.date()
+        except Exception:
+            pass
+
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day"):
+        try:
+            return value
+        except Exception:
+            pass
+
+    number = safe_finite_number(value)
+
+    if number is not None:
+
+        # Be tolerant if a provider ever returns milliseconds.
+        if abs(number) > 100000000000:
+            number = number / 1000.0
+
+        try:
+            return datetime.fromtimestamp(
+                number,
+                tz=ZoneInfo("UTC"),
+            ).date()
+        except (
+            OverflowError,
+            OSError,
+            ValueError,
+        ):
+            pass
+
+    try:
+        return datetime.fromisoformat(
+            str(value).replace(
+                "Z",
+                "+00:00",
+            )
+        ).date()
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def date_with_year(source_date, year):
+    """
+    Copy month/day into another year, handling Feb 29 safely.
+    """
+
+    try:
+        return source_date.replace(
+            year=year
+        )
+    except ValueError:
+        return source_date.replace(
+            year=year,
+            day=28,
+        )
+
+
+def resolve_next_fiscal_year_end(info):
+    """
+    Resolve the upcoming fiscal-year-end date from Yahoo info.
+
+    Priority:
+        nextFiscalYearEnd
+        lastFiscalYearEnd (rolled forward by year)
+
+    Only the month/day pattern is important for calendarization.  If a
+    returned timestamp is stale or more than roughly one year away, we
+    normalize it to the nearest future occurrence of the same month/day.
+    """
+
+    today = datetime.now(
+        ZoneInfo(
+            "America/New_York"
+        )
+    ).date()
+
+    for key in (
+        "nextFiscalYearEnd",
+        "lastFiscalYearEnd",
+    ):
+
+        raw_date = parse_yahoo_date(
+            info.get(key)
+        )
+
+        if raw_date is None:
+            continue
+
+        candidate = raw_date
+
+        # Roll any past date forward while preserving month/day.
+        while candidate < today:
+            candidate = date_with_year(
+                candidate,
+                candidate.year + 1,
+            )
+
+        # If Yahoo gives an unexpectedly distant date, use the same
+        # month/day on the nearest future year instead.
+        if (
+            candidate - today
+        ).days > 370:
+
+            candidate = date_with_year(
+                raw_date,
+                today.year,
+            )
+
+            if candidate < today:
+                candidate = date_with_year(
+                    candidate,
+                    candidate.year + 1,
+                )
+
+        days_until = (
+            candidate - today
+        ).days
+
+        if 0 <= days_until <= 370:
+            return candidate
+
+    return None
+
+
+def get_yahoo_annual_eps_estimates(stock, ticker):
+    """
+    Read Yahoo analyst annual EPS estimates.
+
+    Returns:
+        current_fy_eps -> row 0y / avg
+        plus1y_eps     -> row +1y / avg
+
+    If Yahoo's estimate table is temporarily unavailable, both values
+    are None and the caller can still use info[] fallbacks.
+    """
+
+    try:
+        estimates = stock.get_earnings_estimate()
+    except Exception as exc:
+
+        print(
+            f"{ticker}: annual earnings estimates "
+            f"unavailable ({exc})."
+        )
+
+        return None, None
+
+    if (
+        estimates is None
+        or getattr(
+            estimates,
+            "empty",
+            True,
+        )
+        or "avg" not in estimates.columns
+    ):
+
+        print(
+            f"{ticker}: Yahoo returned no usable "
+            f"annual EPS estimate table."
+        )
+
+        return None, None
+
+    def row_avg(period):
+
+        try:
+            if period not in estimates.index:
+                return None
+
+            return safe_finite_number(
+                estimates.loc[
+                    period,
+                    "avg",
+                ]
+            )
+        except Exception:
+            return None
+
+    current_fy_eps = row_avg("0y")
+    plus1y_eps = row_avg("+1y")
+
+    return (
+        current_fy_eps,
+        plus1y_eps,
+    )
+
+
+def calculate_calendarized_ntm_eps(
+    current_fy_eps,
+    plus1y_eps,
+    fiscal_year_end,
+):
+    """
+    Estimate next-twelve-month EPS from annual analyst estimates.
+
+    Calendarization:
+
+        NTM = 0Y * remaining-current-FY weight
+              + +1Y * next-FY weight
+
+    The remaining-current-FY weight is the fraction of roughly one
+    year left until the upcoming fiscal year end.  This normalizes
+    companies with different fiscal year calendars onto a rolling
+    next-12-month basis.
+    """
+
+    if (
+        current_fy_eps is None
+        or plus1y_eps is None
+        or fiscal_year_end is None
+    ):
+        return None, None, None
+
+    today = datetime.now(
+        ZoneInfo(
+            "America/New_York"
+        )
+    ).date()
+
+    days_remaining = (
+        fiscal_year_end - today
+    ).days
+
+    if (
+        days_remaining < 0
+        or days_remaining > 370
+    ):
+        return None, None, None
+
+    current_fy_weight = max(
+        0.0,
+        min(
+            1.0,
+            days_remaining / 365.25,
+        ),
+    )
+
+    plus1y_weight = (
+        1.0 - current_fy_weight
+    )
+
+    ntm_eps = (
+        float(current_fy_eps)
+        * current_fy_weight
+        + float(plus1y_eps)
+        * plus1y_weight
+    )
+
+    if not math.isfinite(ntm_eps):
+        return None, None, None
+
+    return (
+        ntm_eps,
+        current_fy_weight,
+        plus1y_weight,
+    )
+
+
+def choose_erp_eps(fundamental):
+    """
+    Choose the EPS basis used by Earnings Yield / ERP.
+
+    Priority:
+        NTM -> +1Y -> TTM
+    """
+
+    if not fundamental:
+        return None, None
+
+    for eps_type, key in (
+        ("NTM", "ntm_eps"),
+        ("+1Y", "plus1y_eps"),
+        ("TTM", "ttm_eps"),
+    ):
+
+        eps = safe_finite_number(
+            fundamental.get(key)
+        )
+
+        if eps is not None:
+            return eps, eps_type
+
+    return None, None
+
+
 def fetch_yahoo_fundamental_snapshot(
     ticker,
     current_price,
 ):
     """
-    Fetch one ticker's earnings basis from Yahoo.
+    Fetch one ticker's TTM / NTM / +1Y EPS snapshot from Yahoo.
 
-    Priority:
-        1. Forward EPS
-        2. Forward PE  -> implied EPS = current price / PE
-        3. Trailing EPS
-        4. Trailing PE -> implied EPS = current price / PE
+    TTM EPS:
+        trailingEps
+        fallback: Current Price / trailingPE
+
+    +1Y EPS:
+        analyst estimate table row +1y
+        fallback: forwardEps
+        fallback: Current Price / forwardPE
+
+    NTM EPS:
+        calendarized from analyst rows 0y and +1y using the company's
+        upcoming fiscal year end.
+
+    ERP later chooses:
+        NTM -> +1Y -> TTM
 
     Returns a dict with status:
         ok
@@ -1981,6 +2313,12 @@ def fetch_yahoo_fundamental_snapshot(
     """
 
     ticker = ticker.upper()
+
+    empty_result = {
+        "ttm_eps": None,
+        "ntm_eps": None,
+        "plus1y_eps": None,
+    }
 
     if not ticker_erp_is_applicable(
         ticker
@@ -1993,8 +2331,7 @@ def fetch_yahoo_fundamental_snapshot(
 
         return {
             "status": "not_applicable",
-            "eps": None,
-            "eps_type": None,
+            **empty_result,
         }
 
     try:
@@ -2009,7 +2346,6 @@ def fetch_yahoo_fundamental_snapshot(
             info,
             dict,
         ):
-
             info = {}
 
     except Exception as exc:
@@ -2021,125 +2357,178 @@ def fetch_yahoo_fundamental_snapshot(
 
         return {
             "status": "error",
-            "eps": None,
-            "eps_type": None,
+            **empty_result,
         }
 
-    forward_eps = (
-        safe_finite_number(
-            info.get(
-                "forwardEps"
-            )
+    # -----------------------------------------------------
+    # TTM EPS
+    # -----------------------------------------------------
+
+    ttm_eps = safe_finite_number(
+        info.get(
+            "trailingEps"
         )
     )
 
-    if forward_eps is not None:
+    ttm_source = None
 
-        print(
-            f"{ticker}: fundamental source "
-            f"Forward EPS -> {forward_eps:.4f}"
-        )
+    if ttm_eps is not None:
+        ttm_source = "trailingEps"
 
-        return {
-            "status": "ok",
-            "eps": forward_eps,
-            "eps_type": "Forward EPS",
-        }
+    if ttm_eps is None:
 
-    forward_pe = (
-        safe_finite_number(
-            info.get(
-                "forwardPE"
-            )
-        )
-    )
-
-    if (
-        forward_pe is not None
-        and forward_pe > 0
-        and current_price is not None
-        and current_price > 0
-    ):
-
-        implied_eps = (
-            float(current_price)
-            / forward_pe
-        )
-
-        print(
-            f"{ticker}: fundamental source "
-            f"Forward PE {forward_pe:.4f} "
-            f"-> implied EPS {implied_eps:.4f}"
-        )
-
-        return {
-            "status": "ok",
-            "eps": implied_eps,
-            "eps_type": "Forward PE",
-        }
-
-    trailing_eps = (
-        safe_finite_number(
-            info.get(
-                "trailingEps"
-            )
-        )
-    )
-
-    if trailing_eps is not None:
-
-        print(
-            f"{ticker}: fundamental source "
-            f"Trailing EPS -> {trailing_eps:.4f}"
-        )
-
-        return {
-            "status": "ok",
-            "eps": trailing_eps,
-            "eps_type": "Trailing EPS",
-        }
-
-    trailing_pe = (
-        safe_finite_number(
+        trailing_pe = safe_finite_number(
             info.get(
                 "trailingPE"
             )
         )
+
+        if (
+            trailing_pe is not None
+            and trailing_pe > 0
+            and current_price is not None
+            and current_price > 0
+        ):
+
+            ttm_eps = (
+                float(current_price)
+                / trailing_pe
+            )
+
+            ttm_source = (
+                "trailingPE implied"
+            )
+
+    # -----------------------------------------------------
+    # Current FY (0y) + next full FY (+1y)
+    # -----------------------------------------------------
+
+    (
+        current_fy_eps,
+        plus1y_eps,
+    ) = get_yahoo_annual_eps_estimates(
+        stock,
+        ticker,
     )
 
-    if (
-        trailing_pe is not None
-        and trailing_pe > 0
-        and current_price is not None
-        and current_price > 0
-    ):
+    plus1y_source = (
+        "+1y analyst estimate"
+        if plus1y_eps is not None
+        else None
+    )
 
-        implied_eps = (
-            float(current_price)
-            / trailing_pe
+    if plus1y_eps is None:
+
+        plus1y_eps = safe_finite_number(
+            info.get(
+                "forwardEps"
+            )
         )
 
+        if plus1y_eps is not None:
+            plus1y_source = "forwardEps fallback"
+
+    if plus1y_eps is None:
+
+        forward_pe = safe_finite_number(
+            info.get(
+                "forwardPE"
+            )
+        )
+
+        if (
+            forward_pe is not None
+            and forward_pe > 0
+            and current_price is not None
+            and current_price > 0
+        ):
+
+            plus1y_eps = (
+                float(current_price)
+                / forward_pe
+            )
+
+            plus1y_source = (
+                "forwardPE implied fallback"
+            )
+
+    # -----------------------------------------------------
+    # NTM EPS calendarization
+    # -----------------------------------------------------
+
+    fiscal_year_end = (
+        resolve_next_fiscal_year_end(
+            info
+        )
+    )
+
+    (
+        ntm_eps,
+        current_fy_weight,
+        plus1y_weight,
+    ) = calculate_calendarized_ntm_eps(
+        current_fy_eps,
+        plus1y_eps,
+        fiscal_year_end,
+    )
+
+    if ttm_eps is not None:
+
         print(
-            f"{ticker}: fundamental source "
-            f"Trailing PE {trailing_pe:.4f} "
-            f"-> implied EPS {implied_eps:.4f}"
+            f"{ticker}: TTM EPS={ttm_eps:.4f} "
+            f"({ttm_source})."
+        )
+
+    if plus1y_eps is not None:
+
+        print(
+            f"{ticker}: +1Y EPS={plus1y_eps:.4f} "
+            f"({plus1y_source})."
+        )
+
+    if ntm_eps is not None:
+
+        print(
+            f"{ticker}: NTM EPS={ntm_eps:.4f} "
+            f"from 0Y={current_fy_eps:.4f}, "
+            f"+1Y={plus1y_eps:.4f}, "
+            f"FYE={fiscal_year_end}, "
+            f"weights={current_fy_weight:.3f}/"
+            f"{plus1y_weight:.3f}."
+        )
+
+    elif (
+        current_fy_eps is not None
+        and plus1y_eps is not None
+    ):
+
+        print(
+            f"{ticker}: 0Y/+1Y estimates exist but "
+            f"fiscal year end could not be resolved; "
+            f"NTM EPS unavailable."
+        )
+
+    if (
+        ttm_eps is None
+        and ntm_eps is None
+        and plus1y_eps is None
+    ):
+
+        print(
+            f"{ticker}: Yahoo returned no usable "
+            f"TTM, NTM, or +1Y EPS."
         )
 
         return {
-            "status": "ok",
-            "eps": implied_eps,
-            "eps_type": "Trailing PE",
+            "status": "no_data",
+            **empty_result,
         }
 
-    print(
-        f"{ticker}: Yahoo returned no usable "
-        f"Forward/Trailing EPS or PE."
-    )
-
     return {
-        "status": "no_data",
-        "eps": None,
-        "eps_type": None,
+        "status": "ok",
+        "ttm_eps": ttm_eps,
+        "ntm_eps": ntm_eps,
+        "plus1y_eps": plus1y_eps,
     }
 
 
@@ -2150,16 +2539,15 @@ def prepare_fundamental_snapshots(
     """
     Build the fundamental snapshot used by this run.
 
-    Existing Notion values act as the cross-run cache.
+    Existing Notion TTM / NTM / +1Y fields act as the cross-run cache.
 
-    To reduce Yahoo request volume, only
-    FUNDAMENTAL_REFRESH_BATCH_SIZE stale tickers are refreshed in
-    one workflow run.  Because the action runs repeatedly, a first
-    deployment with many blank rows fills in progressively.
+    Only FUNDAMENTAL_REFRESH_BATCH_SIZE stale/migration tickers are
+    refreshed in one workflow run.  A transient request exception
+    preserves cached values and the old timestamp so it can retry.
 
-    A successful refresh or a confirmed "no data" result updates
-    Fundamental Updated.  A transient request exception preserves
-    the old cached values and old timestamp so it can be retried.
+    Rows still carrying the old Forward EPS / Forward PE / Trailing EPS
+    / Trailing PE ERP EPS Type are treated as migration candidates so a
+    renamed old EPS column is never mistaken for true TTM EPS.
     """
 
     snapshots = {}
@@ -2169,12 +2557,20 @@ def prepare_fundamental_snapshots(
         ticker_info.items()
     ):
 
-        eps = info.get(
-            "eps"
+        ttm_eps = info.get(
+            "ttm_eps"
         )
 
-        eps_type = info.get(
-            "eps_type"
+        ntm_eps = info.get(
+            "ntm_eps"
+        )
+
+        plus1y_eps = info.get(
+            "plus1y_eps"
+        )
+
+        old_erp_eps_type = info.get(
+            "erp_eps_type"
         )
 
         updated_at = info.get(
@@ -2187,10 +2583,25 @@ def prepare_fundamental_snapshots(
             )
         )
 
+        legacy_migration = (
+            old_erp_eps_type
+            in LEGACY_ERP_EPS_TYPES
+        )
+
+        # The user's EPS column was renamed during migration.  If the
+        # row still advertises an old Forward/Trailing type, do not trust
+        # any value sitting in the newly named TTM EPS column.
+        if legacy_migration:
+
+            ttm_eps = None
+            ntm_eps = None
+            plus1y_eps = None
+
         snapshots[ticker] = {
             "applicable": applicable,
-            "eps": eps,
-            "eps_type": eps_type,
+            "ttm_eps": ttm_eps,
+            "ntm_eps": ntm_eps,
+            "plus1y_eps": plus1y_eps,
             "updated_at": updated_at,
             "refreshed": False,
         }
@@ -2198,8 +2609,10 @@ def prepare_fundamental_snapshots(
         if not applicable:
 
             if (
-                eps is not None
-                or eps_type is not None
+                ttm_eps is not None
+                or ntm_eps is not None
+                or plus1y_eps is not None
+                or old_erp_eps_type is not None
                 or fundamental_refresh_due(
                     updated_at
                 )
@@ -2207,8 +2620,9 @@ def prepare_fundamental_snapshots(
 
                 snapshots[ticker] = {
                     "applicable": False,
-                    "eps": None,
-                    "eps_type": None,
+                    "ttm_eps": None,
+                    "ntm_eps": None,
+                    "plus1y_eps": None,
                     "updated_at": (
                         fundamental_now_iso()
                     ),
@@ -2217,8 +2631,18 @@ def prepare_fundamental_snapshots(
 
             continue
 
-        if fundamental_refresh_due(
-            updated_at
+        no_cached_eps = (
+            ttm_eps is None
+            and ntm_eps is None
+            and plus1y_eps is None
+        )
+
+        if (
+            legacy_migration
+            or no_cached_eps
+            or fundamental_refresh_due(
+                updated_at
+            )
         ):
 
             refresh_candidates.append(
@@ -2247,9 +2671,9 @@ def prepare_fundamental_snapshots(
 
         print(
             f"Refreshing {len(refresh_now)} of "
-            f"{len(refresh_candidates)} stale "
-            f"fundamentals this run; remaining "
-            f"rows will be handled by later runs."
+            f"{len(refresh_candidates)} stale/migration "
+            f"fundamentals this run; remaining rows "
+            f"will be handled by later runs."
         )
 
     for ticker in refresh_now:
@@ -2281,11 +2705,14 @@ def prepare_fundamental_snapshots(
             "applicable": (
                 status != "not_applicable"
             ),
-            "eps": result.get(
-                "eps"
+            "ttm_eps": result.get(
+                "ttm_eps"
             ),
-            "eps_type": result.get(
-                "eps_type"
+            "ntm_eps": result.get(
+                "ntm_eps"
+            ),
+            "plus1y_eps": result.get(
+                "plus1y_eps"
             ),
             "updated_at": (
                 fundamental_now_iso()
@@ -2305,6 +2732,9 @@ def build_valuation_snapshot(
     """
     Calculate Earnings Yield and ERP for one ticker.
 
+    ERP EPS basis priority:
+        NTM -> +1Y -> TTM
+
     Number values are decimal fractions:
         0.0432 -> 4.32% in a Notion Percent field.
     """
@@ -2318,12 +2748,11 @@ def build_valuation_snapshot(
     ):
         return None
 
-    eps = fundamental.get(
-        "eps"
-    )
-
-    eps_type = fundamental.get(
-        "eps_type"
+    (
+        eps,
+        eps_type,
+    ) = choose_erp_eps(
+        fundamental
     )
 
     if (
@@ -2371,6 +2800,15 @@ def build_valuation_snapshot(
         "ticker": ticker,
         "eps": float(eps),
         "eps_type": eps_type,
+        "ttm_eps": fundamental.get(
+            "ttm_eps"
+        ),
+        "ntm_eps": fundamental.get(
+            "ntm_eps"
+        ),
+        "plus1y_eps": fundamental.get(
+            "plus1y_eps"
+        ),
         "earnings_yield": (
             earnings_yield
         ),
@@ -2437,8 +2875,10 @@ def update_notion_price(
         Daily High
         Daily Low
         Daily Range Date
-        EPS
-        EPS Type
+        TTM EPS
+        NTM EPS
+        +1Y EPS
+        ERP EPS Type
         Earnings Yield
         10Y Yield
         ERP
@@ -2502,9 +2942,6 @@ def update_notion_price(
 
     # -----------------------------------------------------
     # 10Y Yield
-    #
-    # Notion's field is formatted as Percent, so write the
-    # decimal fraction (4.25% -> 0.0425).
     # -----------------------------------------------------
 
     if ten_year_yield is not None:
@@ -2523,34 +2960,48 @@ def update_notion_price(
 
     if fundamental is not None:
 
-        eps = fundamental.get(
-            "eps"
+        ttm_eps = fundamental.get(
+            "ttm_eps"
         )
 
-        eps_type = fundamental.get(
-            "eps_type"
+        ntm_eps = fundamental.get(
+            "ntm_eps"
+        )
+
+        plus1y_eps = fundamental.get(
+            "plus1y_eps"
         )
 
         updated_at = fundamental.get(
             "updated_at"
         )
 
-        properties["EPS"] = {
+        properties[
+            "TTM EPS"
+        ] = {
             "number": (
-                float(eps)
-                if eps is not None
+                float(ttm_eps)
+                if ttm_eps is not None
                 else None
             )
         }
 
         properties[
-            "EPS Type"
+            "NTM EPS"
         ] = {
-            "select": (
-                {
-                    "name": eps_type
-                }
-                if eps_type
+            "number": (
+                float(ntm_eps)
+                if ntm_eps is not None
+                else None
+            )
+        }
+
+        properties[
+            "+1Y EPS"
+        ] = {
+            "number": (
+                float(plus1y_eps)
+                if plus1y_eps is not None
                 else None
             )
         }
@@ -2565,16 +3016,16 @@ def update_notion_price(
                 }
             }
 
-        # If there is no usable earnings basis, explicitly clear
-        # the valuation fields so stale ERP values do not linger.
-        if (
-            eps is None
-            or not eps_type
-            or not fundamental.get(
-                "applicable",
-                True,
-            )
+        if not fundamental.get(
+            "applicable",
+            True,
         ):
+
+            properties[
+                "ERP EPS Type"
+            ] = {
+                "select": None
+            }
 
             properties[
                 "Earnings Yield"
@@ -2589,13 +3040,26 @@ def update_notion_price(
             }
 
     # -----------------------------------------------------
-    # Current Earnings Yield / ERP
-    #
-    # EPS is cached, but these values are recalculated every run
-    # using the latest current price and latest available 10Y yield.
+    # Current ERP basis / Earnings Yield / ERP
     # -----------------------------------------------------
 
     if valuation is not None:
+
+        eps_type = valuation.get(
+            "eps_type"
+        )
+
+        properties[
+            "ERP EPS Type"
+        ] = {
+            "select": (
+                {
+                    "name": eps_type
+                }
+                if eps_type
+                else None
+            )
+        }
 
         properties[
             "Earnings Yield"
@@ -2617,6 +3081,28 @@ def update_notion_price(
                 if erp is not None
                 else None
             )
+        }
+
+    elif fundamental is not None:
+
+        # No usable price/EPS basis -> make sure old valuation values
+        # and old Forward EPS labels do not linger in Notion.
+        properties[
+            "ERP EPS Type"
+        ] = {
+            "select": None
+        }
+
+        properties[
+            "Earnings Yield"
+        ] = {
+            "number": None
+        }
+
+        properties[
+            "ERP"
+        ] = {
+            "number": None
         }
 
     payload = {
@@ -2659,6 +3145,22 @@ def update_notion_price(
                 f"low=${daily_range['low']:.2f}, "
                 f"date={daily_range['date']}"
             )
+
+    if fundamental is not None:
+
+        def eps_log(value):
+            return (
+                f"{value:.4f}"
+                if value is not None
+                else "N/A"
+            )
+
+        print(
+            f"{ticker}: EPS snapshot "
+            f"TTM={eps_log(fundamental.get('ttm_eps'))}, "
+            f"NTM={eps_log(fundamental.get('ntm_eps'))}, "
+            f"+1Y={eps_log(fundamental.get('plus1y_eps'))}"
+        )
 
     if valuation is not None:
 
@@ -3676,8 +4178,10 @@ def add_missing_note_tickers_to_stock_price(
             "page_id": page["id"],
             "last_alert_range": "",
             "previous_price": 0.0,
-            "eps": None,
-            "eps_type": None,
+            "ttm_eps": None,
+            "ntm_eps": None,
+            "plus1y_eps": None,
+            "erp_eps_type": None,
             "fundamental_updated": None,
             "ten_year_yield": None,
         }
@@ -4328,10 +4832,13 @@ def build_erp_text(
 
     Example:
 
-        ERP：-1.42%
-        Earnings Yield：2.68%
+        ERP：+1.71%
+        Earnings Yield：5.81%
         10Y Yield：4.10%
-        依据：Forward EPS 8.73
+        依据：NTM EPS 13.60
+        TTM EPS：7.91
+        NTM EPS：13.60
+        +1Y EPS：15.70
     """
 
     if not valuation:
@@ -4366,30 +4873,35 @@ def build_erp_text(
     ):
         return ""
 
-    if eps_type in {
-        "Forward PE",
-        "Trailing PE",
-    }:
+    lines = [
+        f"ERP：{erp * 100:+.2f}%",
+        (
+            f"Earnings Yield："
+            f"{earnings_yield * 100:.2f}%"
+        ),
+        (
+            f"10Y Yield："
+            f"{ten_year_yield * 100:.2f}%"
+        ),
+        f"依据：{eps_type} EPS {eps:.2f}",
+    ]
 
-        basis_text = (
-            f"{eps_type}"
-            f"（隐含 EPS {eps:.2f}）"
+    for label, key in (
+        ("TTM EPS", "ttm_eps"),
+        ("NTM EPS", "ntm_eps"),
+        ("+1Y EPS", "plus1y_eps"),
+    ):
+
+        value = safe_finite_number(
+            valuation.get(key)
         )
 
-    else:
+        if value is not None:
+            lines.append(
+                f"{label}：{value:.2f}"
+            )
 
-        basis_text = (
-            f"{eps_type} {eps:.2f}"
-        )
-
-    return (
-        f"ERP：{erp * 100:+.2f}%\n"
-        f"Earnings Yield："
-        f"{earnings_yield * 100:.2f}%\n"
-        f"10Y Yield："
-        f"{ten_year_yield * 100:.2f}%\n"
-        f"依据：{basis_text}"
-    )
+    return "\n".join(lines)
 
 
 def build_alert_message(
@@ -5335,17 +5847,31 @@ def main():
                 )
             ),
 
-            "eps": (
+            "ttm_eps": (
                 get_number_property(
                     page,
-                    "EPS",
+                    "TTM EPS",
                 )
             ),
 
-            "eps_type": (
+            "ntm_eps": (
+                get_number_property(
+                    page,
+                    "NTM EPS",
+                )
+            ),
+
+            "plus1y_eps": (
+                get_number_property(
+                    page,
+                    "+1Y EPS",
+                )
+            ),
+
+            "erp_eps_type": (
                 get_select_property_name(
                     page,
-                    "EPS Type",
+                    "ERP EPS Type",
                 )
             ),
 
