@@ -121,6 +121,9 @@ TRADINGVIEW_HEADERS = {
 # NTM PEG = (Current Price / NTM EPS) / ((NTM EPS / TTM EPS - 1) * 100)
 # NTM PEG is stored as Rich text so unavailable cases can show a reason.
 #
+# PE 90D Position % = (Current Price - PE90 Low) / (PE90 High - PE90 Low)
+# It is recalculated every workflow run from the latest Current Price.
+#
 # ERP basis priority:
 #
 #     1. NTM
@@ -3184,6 +3187,123 @@ def format_compact_valuation_price(value):
     return f"{value:.2f}"
 
 
+def parse_pe_90d_valuation_bounds(text):
+    """
+    Parse the visible PE 90D valuation range stored in Notion.
+
+    Expected valid format:
+        224-260（中位242）
+        80.4-110（中位95.1）
+
+    Human-readable unavailable reasons such as:
+        无估值：历史存在负EPS
+        不适用：ETF/指数
+
+    intentionally return (None, None).
+
+    The position metric is based on the SAME rounded range the user sees
+    in Notion, so the percentage is directly interpretable from the table.
+    """
+
+    text = str(
+        text
+        or ""
+    ).strip()
+
+    match = re.match(
+        r"^([0-9]+(?:\.[0-9]+)?)"
+        r"\s*-\s*"
+        r"([0-9]+(?:\.[0-9]+)?)",
+        text,
+    )
+
+    if not match:
+        return None, None
+
+    try:
+        low = float(
+            match.group(1)
+        )
+        high = float(
+            match.group(2)
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None, None
+
+    if (
+        not math.isfinite(low)
+        or not math.isfinite(high)
+        or low <= 0
+        or high <= low
+    ):
+        return None, None
+
+    return low, high
+
+
+def calculate_pe_90d_position(
+    current_price,
+    pe_90d_valuation,
+):
+    """
+    Return the current price's normalized location inside the PE 90D band.
+
+        0.0 = valuation lower bound
+        0.5 = midpoint of the band
+        1.0 = valuation upper bound
+
+    Values are intentionally NOT clamped:
+        < 0.0 means price is below the lower bound
+        > 1.0 means price is above the upper bound
+
+    Returns None when the valuation band itself is unavailable.
+    """
+
+    current_price = safe_finite_number(
+        current_price
+    )
+
+    if (
+        current_price is None
+        or current_price <= 0
+    ):
+        return None
+
+    (
+        value_low,
+        value_high,
+    ) = parse_pe_90d_valuation_bounds(
+        pe_90d_valuation
+    )
+
+    if (
+        value_low is None
+        or value_high is None
+    ):
+        return None
+
+    denominator = (
+        value_high
+        - value_low
+    )
+
+    if denominator <= 0:
+        return None
+
+    position = (
+        current_price
+        - value_low
+    ) / denominator
+
+    if not math.isfinite(position):
+        return None
+
+    return position
+
+
 def calculate_pe_90d_valuation(
     stock,
     ticker,
@@ -4172,6 +4292,18 @@ def build_valuation_snapshot(
 
     NTM PEG is written to Notion as Rich text so a missing value can explain
     WHY it is unavailable instead of leaving a blank cell.
+
+    PE 90D Position % is recalculated EVERY workflow run from the latest
+    Current Price and the cached PE 90D valuation band:
+
+        Position = (Current Price - Low) / (High - Low)
+
+    Therefore:
+        0%   = lower bound
+        50%  = midpoint
+        100% = upper bound
+        <0%  = below the valuation band
+        >100%= above the valuation band
     """
 
     if not fundamental:
@@ -4192,6 +4324,21 @@ def build_valuation_snapshot(
     pe_peg_applicable = fundamental.get(
         "pe_peg_applicable",
         True,
+    )
+
+    pe_90d_valuation = str(
+        fundamental.get(
+            "pe_90d_valuation",
+            "",
+        )
+        or ""
+    ).strip()
+
+    pe_90d_position = (
+        calculate_pe_90d_position(
+            current_price,
+            pe_90d_valuation,
+        )
     )
 
     ntm_pe = None
@@ -4346,9 +4493,8 @@ def build_valuation_snapshot(
         "plus1y_eps": fundamental.get(
             "plus1y_eps"
         ),
-        "pe_90d_valuation": fundamental.get(
-            "pe_90d_valuation"
-        ),
+        "pe_90d_valuation": pe_90d_valuation,
+        "pe_90d_position": pe_90d_position,
         "ntm_pe": ntm_pe,
         "ntm_growth": ntm_growth,
         "ntm_peg": ntm_peg,
@@ -4418,6 +4564,7 @@ def update_notion_price(
         NTM EPS
         +1Y EPS
         PE 90D Valuation
+        PE 90D Position %
         NTM PEG
         ERP EPS Type
         Earnings Yield
@@ -4693,6 +4840,22 @@ def update_notion_price(
             )
         }
 
+        pe_90d_position = safe_finite_number(
+            valuation.get(
+                "pe_90d_position"
+            )
+        )
+
+        properties[
+            "PE 90D Position %"
+        ] = {
+            "number": (
+                float(pe_90d_position)
+                if pe_90d_position is not None
+                else None
+            )
+        }
+
     elif fundamental is not None:
 
         # No usable price/EPS basis -> make sure old valuation values
@@ -4726,6 +4889,12 @@ def update_notion_price(
                     },
                 }
             ]
+        }
+
+        properties[
+            "PE 90D Position %"
+        ] = {
+            "number": None
         }
 
     payload = {
@@ -4822,10 +4991,23 @@ def update_notion_price(
             or "N/A"
         )
 
+        pe_90d_position = safe_finite_number(
+            valuation.get(
+                "pe_90d_position"
+            )
+        )
+
+        pe_90d_position_text = (
+            f"{pe_90d_position * 100:.1f}%"
+            if pe_90d_position is not None
+            else "N/A"
+        )
+
         print(
             f"{ticker}: Earnings Yield="
             f"{earnings_yield_text}, "
             f"ERP={erp_text}, "
+            f"PE 90D Position={pe_90d_position_text}, "
             f"NTM PEG={ntm_peg_text}, "
             f"source={eps_type_text}"
         )
@@ -6485,6 +6667,7 @@ def build_pe_peg_text(
     Examples:
 
         PE 90D估值：224-260（中位242）
+        PE 90D位置：27.8%
         NTM PEG：0.23
 
         PE 90D估值：无估值：历史存在负EPS
@@ -6507,6 +6690,18 @@ def build_pe_peg_text(
     if pe_90d_valuation:
         lines.append(
             f"PE 90D估值：{pe_90d_valuation}"
+        )
+
+    pe_90d_position = safe_finite_number(
+        valuation.get(
+            "pe_90d_position"
+        )
+    )
+
+    if pe_90d_position is not None:
+        lines.append(
+            f"PE 90D位置："
+            f"{pe_90d_position * 100:.1f}%"
         )
 
     ntm_peg_text = str(
