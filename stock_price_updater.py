@@ -4,7 +4,7 @@ import json
 import math
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -110,6 +110,16 @@ TRADINGVIEW_HEADERS = {
 #               + +1Y EPS * next-FY weight
 #
 # The weight is based on the company's upcoming fiscal year end.
+# A fiscal-year rollover guard uses +1Y as a temporary NTM proxy when
+# Yahoo's nextFiscalYearEnd has passed but estimate labels have not rolled.
+#
+# PE 90D Valuation uses point-in-time historical PE(TTM) over the most recent
+# 90 CALENDAR days. Historical TTM EPS is rebuilt from quarterly Diluted EPS
+# and earnings timestamps; current trailingEps bridges a newly released quarter
+# when Yahoo's quarterly statement table is temporarily behind.
+#
+# NTM PEG = (Current Price / NTM EPS) / ((NTM EPS / TTM EPS - 1) * 100)
+#
 # ERP basis priority:
 #
 #     1. NTM
@@ -124,6 +134,14 @@ TEN_YEAR_YIELD_TICKER = "^TNX"
 
 FUNDAMENTAL_REFRESH_HOURS = 24
 FUNDAMENTAL_REFRESH_BATCH_SIZE = 20
+
+# PE(TTM) tracking valuation uses the most recent 90 CALENDAR days.
+# The Yahoo calls needed for this are made only during the existing
+# fundamental refresh, so the 2-minute price workflow does not repeatedly
+# download 1-year daily history / income statements.
+PE_LOOKBACK_CALENDAR_DAYS = 90
+EARNINGS_DATE_LIMIT = 20
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 ERP_EPS_TYPES = {
     "NTM",
@@ -349,6 +367,36 @@ def get_number_property(
         return None
 
     return value
+
+
+def get_rich_text_property(
+    page,
+    property_name,
+):
+    """
+    Read a Rich text property from a Stocks Price row.
+    """
+
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
+    )
+
+    if not prop:
+        return ""
+
+    items = prop.get(
+        "rich_text",
+        [],
+    )
+
+    return "".join(
+        item.get(
+            "plain_text",
+            "",
+        )
+        for item in items
+    ).strip()
 
 
 def get_select_property_name(
@@ -2255,6 +2303,1137 @@ def calculate_calendarized_ntm_eps(
     )
 
 
+def calculate_ntm_eps_with_rollover_protection(
+    current_fy_eps,
+    plus1y_eps,
+    info,
+):
+    """
+    Calculate NTM EPS while protecting the fiscal-year-rollover edge case.
+
+    Normal case:
+        nextFiscalYearEnd is still in the future
+        -> calendarize 0Y / +1Y.
+
+    Rollover-pending case:
+        Yahoo's nextFiscalYearEnd is already in the past, but the analyst
+        estimate labels have not rolled forward yet
+        -> use +1Y as a temporary NTM proxy instead of incorrectly rolling
+           the stale fiscal-year date forward and mixing stale 0Y/+1Y labels.
+
+    If Yahoo omits nextFiscalYearEnd completely, lastFiscalYearEnd may be
+    rolled forward as a lower-confidence fallback.
+    """
+
+    today = datetime.now(
+        MARKET_TIMEZONE
+    ).date()
+
+    raw_next_fye = parse_yahoo_date(
+        info.get(
+            "nextFiscalYearEnd"
+        )
+    )
+
+    raw_last_fye = parse_yahoo_date(
+        info.get(
+            "lastFiscalYearEnd"
+        )
+    )
+
+    # -----------------------------------------------------
+    # Normal Yahoo state
+    # -----------------------------------------------------
+
+    if (
+        raw_next_fye is not None
+        and raw_next_fye > today
+    ):
+
+        (
+            ntm_eps,
+            current_fy_weight,
+            plus1y_weight,
+        ) = calculate_calendarized_ntm_eps(
+            current_fy_eps,
+            plus1y_eps,
+            raw_next_fye,
+        )
+
+        if ntm_eps is not None:
+            return {
+                "ntm_eps": ntm_eps,
+                "current_fy_weight": current_fy_weight,
+                "plus1y_weight": plus1y_weight,
+                "fiscal_year_end": raw_next_fye,
+                "mode": "calendarized 0Y/+1Y",
+            }
+
+    # -----------------------------------------------------
+    # Fiscal-year rollover pending
+    # -----------------------------------------------------
+
+    if (
+        raw_next_fye is not None
+        and raw_next_fye <= today
+        and plus1y_eps is not None
+    ):
+
+        return {
+            "ntm_eps": float(plus1y_eps),
+            "current_fy_weight": None,
+            "plus1y_weight": None,
+            "fiscal_year_end": raw_next_fye,
+            "mode": (
+                "+1Y proxy "
+                "(fiscal-year rollover pending)"
+            ),
+        }
+
+    # -----------------------------------------------------
+    # nextFiscalYearEnd missing -> infer from last FYE
+    # -----------------------------------------------------
+
+    if (
+        raw_next_fye is None
+        and raw_last_fye is not None
+    ):
+
+        inferred_fye = date_with_year(
+            raw_last_fye,
+            today.year,
+        )
+
+        if inferred_fye <= today:
+            inferred_fye = date_with_year(
+                inferred_fye,
+                inferred_fye.year + 1,
+            )
+
+        (
+            ntm_eps,
+            current_fy_weight,
+            plus1y_weight,
+        ) = calculate_calendarized_ntm_eps(
+            current_fy_eps,
+            plus1y_eps,
+            inferred_fye,
+        )
+
+        if ntm_eps is not None:
+            return {
+                "ntm_eps": ntm_eps,
+                "current_fy_weight": current_fy_weight,
+                "plus1y_weight": plus1y_weight,
+                "fiscal_year_end": inferred_fye,
+                "mode": "calendarized from inferred FYE",
+            }
+
+    # -----------------------------------------------------
+    # Last forward fallback
+    # -----------------------------------------------------
+
+    if plus1y_eps is not None:
+
+        return {
+            "ntm_eps": float(plus1y_eps),
+            "current_fy_weight": None,
+            "plus1y_weight": None,
+            "fiscal_year_end": raw_next_fye,
+            "mode": "+1Y proxy fallback",
+        }
+
+    return {
+        "ntm_eps": None,
+        "current_fy_weight": None,
+        "plus1y_weight": None,
+        "fiscal_year_end": raw_next_fye,
+        "mode": None,
+    }
+
+
+def normalize_yahoo_statement_label(value):
+    """
+    Normalize Yahoo statement row / column names for tolerant matching.
+    """
+
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(value).lower(),
+    )
+
+
+def get_yahoo_quarterly_eps_records(
+    stock,
+    ticker,
+):
+    """
+    Read historical quarterly GAAP EPS from Yahoo's quarterly income statement.
+
+    Diluted EPS is preferred. Basic EPS is only a fallback when diluted EPS is
+    genuinely unavailable.
+    """
+
+    try:
+        statement = stock.get_income_stmt(
+            freq="quarterly"
+        )
+    except Exception as exc:
+
+        print(
+            f"{ticker}: quarterly income statement "
+            f"unavailable ({exc})."
+        )
+
+        return [], None
+
+    if (
+        statement is None
+        or getattr(
+            statement,
+            "empty",
+            True,
+        )
+    ):
+        return [], None
+
+    row_name = None
+    source = None
+
+    diluted_names = {
+        "dilutedeps",
+        "dilutedearningspershare",
+    }
+
+    basic_names = {
+        "basiceps",
+        "basicearningspershare",
+    }
+
+    for candidate in statement.index:
+
+        if (
+            normalize_yahoo_statement_label(
+                candidate
+            )
+            in diluted_names
+        ):
+
+            row_name = candidate
+            source = "quarterly Diluted EPS"
+            break
+
+    if row_name is None:
+
+        for candidate in statement.index:
+
+            if (
+                normalize_yahoo_statement_label(
+                    candidate
+                )
+                in basic_names
+            ):
+
+                row_name = candidate
+                source = "quarterly Basic EPS fallback"
+                break
+
+    if row_name is None:
+        return [], None
+
+    records = []
+
+    try:
+        row = statement.loc[
+            row_name
+        ]
+    except Exception:
+        return [], None
+
+    for column, raw_eps in row.items():
+
+        eps = safe_finite_number(
+            raw_eps
+        )
+
+        quarter_end = parse_yahoo_date(
+            column
+        )
+
+        if (
+            eps is None
+            or quarter_end is None
+        ):
+            continue
+
+        records.append(
+            {
+                "quarter_end": quarter_end,
+                "quarter_eps": eps,
+            }
+        )
+
+    records.sort(
+        key=lambda item: item[
+            "quarter_end"
+        ]
+    )
+
+    return records, source
+
+
+def get_yahoo_earnings_event_records(
+    stock,
+    ticker,
+):
+    """
+    Read Yahoo earnings timestamps.
+
+    Reported EPS is NOT used to build TTM EPS because Yahoo's earnings-page
+    reported EPS can be an adjusted / non-GAAP measure. It is used only to
+    distinguish completed releases from future scheduled releases for the
+    latest-statement bridge.
+    """
+
+    try:
+        events = stock.get_earnings_dates(
+            limit=EARNINGS_DATE_LIMIT
+        )
+    except Exception as exc:
+
+        print(
+            f"{ticker}: earnings dates unavailable "
+            f"({exc})."
+        )
+
+        return []
+
+    if (
+        events is None
+        or getattr(
+            events,
+            "empty",
+            True,
+        )
+    ):
+        return []
+
+    reported_column = None
+
+    for column in events.columns:
+
+        if (
+            normalize_yahoo_statement_label(
+                column
+            )
+            == "reportedeps"
+        ):
+
+            reported_column = column
+            break
+
+    records = []
+
+    for index, row in events.iterrows():
+
+        try:
+            timestamp = (
+                index.to_pydatetime()
+                if hasattr(
+                    index,
+                    "to_pydatetime",
+                )
+                else index
+            )
+
+            if not isinstance(
+                timestamp,
+                datetime,
+            ):
+                continue
+
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(
+                    tzinfo=MARKET_TIMEZONE
+                )
+            else:
+                timestamp = timestamp.astimezone(
+                    MARKET_TIMEZONE
+                )
+
+        except Exception:
+            continue
+
+        reported_eps = None
+
+        if reported_column is not None:
+            reported_eps = safe_finite_number(
+                row.get(
+                    reported_column
+                )
+            )
+
+        records.append(
+            {
+                "earnings_dt": timestamp,
+                "earnings_date": timestamp.date(),
+                "reported_eps": reported_eps,
+            }
+        )
+
+    records.sort(
+        key=lambda item: item[
+            "earnings_dt"
+        ]
+    )
+
+    return records
+
+
+def map_quarterly_eps_to_earnings_events(
+    quarterly_eps,
+    earnings_events,
+):
+    """
+    Match each reported fiscal quarter to the first earnings event after the
+    quarter end and within 150 days.
+    """
+
+    if (
+        not quarterly_eps
+        or not earnings_events
+    ):
+        return []
+
+    now_market = datetime.now(
+        MARKET_TIMEZONE
+    )
+
+    completed_events = [
+        event
+        for event in earnings_events
+        if event[
+            "earnings_dt"
+        ] <= now_market
+    ]
+
+    used_indexes = set()
+    mapped = []
+
+    for quarter in quarterly_eps:
+
+        candidates = []
+
+        for event_index, event in enumerate(
+            completed_events
+        ):
+
+            if event_index in used_indexes:
+                continue
+
+            day_delta = (
+                event[
+                    "earnings_date"
+                ]
+                - quarter[
+                    "quarter_end"
+                ]
+            ).days
+
+            if 0 <= day_delta <= 150:
+                candidates.append(
+                    (
+                        day_delta,
+                        event_index,
+                        event,
+                    )
+                )
+
+        earnings_dt = None
+        earnings_date = None
+
+        if candidates:
+
+            candidates.sort(
+                key=lambda item: item[0]
+            )
+
+            (
+                _day_delta,
+                event_index,
+                event,
+            ) = candidates[0]
+
+            used_indexes.add(
+                event_index
+            )
+
+            earnings_dt = event[
+                "earnings_dt"
+            ]
+
+            earnings_date = event[
+                "earnings_date"
+            ]
+
+        mapped.append(
+            {
+                **quarter,
+                "earnings_dt": earnings_dt,
+                "earnings_date": earnings_date,
+            }
+        )
+
+    return mapped
+
+
+def get_yahoo_daily_close_records(
+    stock,
+    ticker,
+):
+    """
+    Fetch one year of daily closes used for the 90-calendar-day PE(TTM) window.
+    """
+
+    try:
+        history = stock.history(
+            period="1y",
+            interval="1d",
+            auto_adjust=False,
+        )
+    except Exception as exc:
+
+        print(
+            f"{ticker}: daily history unavailable "
+            f"({exc})."
+        )
+
+        return []
+
+    if (
+        history is None
+        or getattr(
+            history,
+            "empty",
+            True,
+        )
+        or "Close" not in history.columns
+    ):
+        return []
+
+    records = []
+
+    for index, row in history.iterrows():
+
+        close = safe_finite_number(
+            row.get(
+                "Close"
+            )
+        )
+
+        if (
+            close is None
+            or close <= 0
+        ):
+            continue
+
+        try:
+            timestamp = (
+                index.to_pydatetime()
+                if hasattr(
+                    index,
+                    "to_pydatetime",
+                )
+                else index
+            )
+
+            if isinstance(
+                timestamp,
+                datetime,
+            ):
+
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(
+                        tzinfo=MARKET_TIMEZONE
+                    )
+                else:
+                    timestamp = timestamp.astimezone(
+                        MARKET_TIMEZONE
+                    )
+
+                trade_date = timestamp.date()
+
+            else:
+                trade_date = parse_yahoo_date(
+                    timestamp
+                )
+
+        except Exception:
+            trade_date = None
+
+        if trade_date is None:
+            continue
+
+        records.append(
+            {
+                "trade_date": trade_date,
+                "close": close,
+            }
+        )
+
+    records.sort(
+        key=lambda item: item[
+            "trade_date"
+        ]
+    )
+
+    return records
+
+
+def effective_trade_date_for_earnings(
+    earnings_dt,
+    trading_dates,
+):
+    """
+    Determine when a newly reported EPS becomes usable for DAILY close PE(TTM).
+
+    If earnings are released before 16:00 New York time on a trading day, the
+    same day's closing price can use the new information (e.g. JPM pre-market).
+    At 16:00 or later, use the next trading day (e.g. typical after-close
+    releases such as NVDA/AAPL/MU in current Yahoo timestamps).
+    """
+
+    if earnings_dt is None:
+        return None
+
+    try:
+        local_dt = earnings_dt.astimezone(
+            MARKET_TIMEZONE
+        )
+    except Exception:
+        return None
+
+    event_date = local_dt.date()
+    trading_date_set = set(
+        trading_dates
+    )
+
+    released_before_close = (
+        local_dt.hour < 16
+    )
+
+    if (
+        released_before_close
+        and event_date in trading_date_set
+    ):
+        return event_date
+
+    for trade_date in trading_dates:
+
+        if trade_date > event_date:
+            return trade_date
+
+    return None
+
+
+def reconstruct_point_in_time_ttm_states(
+    mapped_quarters,
+    daily_prices,
+    eps_source,
+):
+    """
+    Build TTM EPS states from each consecutive four-quarter window.
+    """
+
+    if (
+        len(mapped_quarters) < 4
+        or not daily_prices
+    ):
+        return []
+
+    trading_dates = [
+        item[
+            "trade_date"
+        ]
+        for item in daily_prices
+    ]
+
+    states = []
+
+    for index in range(
+        3,
+        len(mapped_quarters),
+    ):
+
+        window = mapped_quarters[
+            index - 3:
+            index + 1
+        ]
+
+        earnings_dt = mapped_quarters[
+            index
+        ].get(
+            "earnings_dt"
+        )
+
+        if earnings_dt is None:
+            continue
+
+        ttm_eps = sum(
+            float(
+                item[
+                    "quarter_eps"
+                ]
+            )
+            for item in window
+        )
+
+        effective_date = (
+            effective_trade_date_for_earnings(
+                earnings_dt,
+                trading_dates,
+            )
+        )
+
+        if effective_date is None:
+            continue
+
+        states.append(
+            {
+                "earnings_dt": earnings_dt,
+                "effective_trade_date": effective_date,
+                "ttm_eps": ttm_eps,
+                "source": eps_source,
+            }
+        )
+
+    states.sort(
+        key=lambda item: item[
+            "effective_trade_date"
+        ]
+    )
+
+    return states
+
+
+def bridge_latest_trailing_eps_state(
+    states,
+    earnings_events,
+    daily_prices,
+    current_ttm_eps,
+):
+    """
+    Bridge Yahoo's common post-earnings lag:
+
+    get_info().trailingEps may already include the newly reported quarter while
+    get_income_stmt(freq='quarterly') still stops at the previous quarter.
+    """
+
+    if (
+        current_ttm_eps is None
+        or current_ttm_eps <= 0
+        or not earnings_events
+        or not daily_prices
+    ):
+        return states, False
+
+    last_trade_date = daily_prices[-1][
+        "trade_date"
+    ]
+
+    completed_events = [
+        event
+        for event in earnings_events
+        if (
+            event[
+                "earnings_date"
+            ] <= last_trade_date
+            and event.get(
+                "reported_eps"
+            )
+            is not None
+        )
+    ]
+
+    if not completed_events:
+        return states, False
+
+    latest_event = max(
+        completed_events,
+        key=lambda item: item[
+            "earnings_dt"
+        ],
+    )
+
+    latest_state_dt = None
+
+    if states:
+        latest_state_dt = max(
+            item[
+                "earnings_dt"
+            ]
+            for item in states
+            if item.get(
+                "earnings_dt"
+            )
+            is not None
+        )
+
+    if (
+        latest_state_dt is not None
+        and latest_event[
+            "earnings_dt"
+        ] <= latest_state_dt
+    ):
+        return states, False
+
+    trading_dates = [
+        item[
+            "trade_date"
+        ]
+        for item in daily_prices
+    ]
+
+    effective_date = (
+        effective_trade_date_for_earnings(
+            latest_event[
+                "earnings_dt"
+            ],
+            trading_dates,
+        )
+    )
+
+    if effective_date is None:
+        return states, False
+
+    states = list(
+        states
+    )
+
+    states.append(
+        {
+            "earnings_dt": latest_event[
+                "earnings_dt"
+            ],
+            "effective_trade_date": effective_date,
+            "ttm_eps": float(
+                current_ttm_eps
+            ),
+            "source": "info.trailingEps bridge",
+        }
+    )
+
+    states.sort(
+        key=lambda item: item[
+            "effective_trade_date"
+        ]
+    )
+
+    return states, True
+
+
+def format_compact_valuation_price(value):
+    """
+    Keep the one-column PE valuation text compact in Notion.
+    """
+
+    value = float(value)
+
+    if abs(value) >= 100:
+        return f"{value:.0f}"
+
+    if abs(value) >= 10:
+        return f"{value:.1f}"
+
+    return f"{value:.2f}"
+
+
+def calculate_pe_90d_valuation(
+    stock,
+    ticker,
+    current_ttm_eps,
+):
+    """
+    Calculate the user's PE(TTM) 90-calendar-day tracking valuation.
+
+    Historical daily PE uses the TTM EPS that was publicly available at each
+    historical close. The final valuation band applies the historical PE mean
+    +/- one POPULATION standard deviation to CURRENT TTM EPS.
+
+    Returns:
+        None when Yahoo cannot reconstruct a reliable company PE series.
+        Otherwise a dict containing the compact Notion text and diagnostics.
+    """
+
+    if (
+        current_ttm_eps is None
+        or current_ttm_eps <= 0
+    ):
+        return None
+
+    (
+        quarterly_eps,
+        eps_source,
+    ) = get_yahoo_quarterly_eps_records(
+        stock,
+        ticker,
+    )
+
+    if len(quarterly_eps) < 4:
+        return None
+
+    earnings_events = (
+        get_yahoo_earnings_event_records(
+            stock,
+            ticker,
+        )
+    )
+
+    daily_prices = (
+        get_yahoo_daily_close_records(
+            stock,
+            ticker,
+        )
+    )
+
+    if (
+        not earnings_events
+        or not daily_prices
+    ):
+        return None
+
+    mapped_quarters = (
+        map_quarterly_eps_to_earnings_events(
+            quarterly_eps,
+            earnings_events,
+        )
+    )
+
+    states = (
+        reconstruct_point_in_time_ttm_states(
+            mapped_quarters,
+            daily_prices,
+            eps_source,
+        )
+    )
+
+    (
+        states,
+        bridge_added,
+    ) = bridge_latest_trailing_eps_state(
+        states,
+        earnings_events,
+        daily_prices,
+        current_ttm_eps,
+    )
+
+    if not states:
+        return None
+
+    last_trade_date = daily_prices[-1][
+        "trade_date"
+    ]
+
+    window_start = (
+        last_trade_date
+        - timedelta(
+            days=(
+                PE_LOOKBACK_CALENDAR_DAYS
+                - 1
+            )
+        )
+    )
+
+    window_prices = [
+        item
+        for item in daily_prices
+        if (
+            window_start
+            <= item[
+                "trade_date"
+            ]
+            <= last_trade_date
+        )
+    ]
+
+    if not window_prices:
+        return None
+
+    states = sorted(
+        states,
+        key=lambda item: item[
+            "effective_trade_date"
+        ],
+    )
+
+    state_index = 0
+    current_state = None
+    valid_pe = []
+
+    # Walk the entire available history so a state that became effective
+    # before the 90-day window remains active inside the window.
+    for price_record in daily_prices:
+
+        trade_date = price_record[
+            "trade_date"
+        ]
+
+        while (
+            state_index < len(states)
+            and states[
+                state_index
+            ][
+                "effective_trade_date"
+            ] <= trade_date
+        ):
+
+            current_state = states[
+                state_index
+            ]
+
+            state_index += 1
+
+        if trade_date < window_start:
+            continue
+
+        if current_state is None:
+            continue
+
+        historical_ttm = safe_finite_number(
+            current_state.get(
+                "ttm_eps"
+            )
+        )
+
+        close = safe_finite_number(
+            price_record.get(
+                "close"
+            )
+        )
+
+        if (
+            historical_ttm is None
+            or historical_ttm <= 0
+            or close is None
+            or close <= 0
+        ):
+            continue
+
+        pe = close / historical_ttm
+
+        if (
+            math.isfinite(pe)
+            and pe > 0
+        ):
+            valid_pe.append(
+                pe
+            )
+
+    coverage = (
+        len(valid_pe)
+        / max(
+            len(window_prices),
+            1,
+        )
+    )
+
+    if (
+        len(valid_pe) < 2
+        or coverage < 0.95
+    ):
+
+        print(
+            f"{ticker}: PE 90D unavailable; "
+            f"coverage={coverage * 100:.1f}%."
+        )
+
+        return None
+
+    pe_mean = (
+        sum(valid_pe)
+        / len(valid_pe)
+    )
+
+    variance = (
+        sum(
+            (
+                value - pe_mean
+            ) ** 2
+            for value in valid_pe
+        )
+        / len(valid_pe)
+    )
+
+    pe_sd = math.sqrt(
+        variance
+    )
+
+    low_pe = pe_mean - pe_sd
+    high_pe = pe_mean + pe_sd
+
+    if (
+        low_pe <= 0
+        or not math.isfinite(
+            high_pe
+        )
+    ):
+        return None
+
+    value_low = (
+        low_pe
+        * float(
+            current_ttm_eps
+        )
+    )
+
+    value_mid = (
+        pe_mean
+        * float(
+            current_ttm_eps
+        )
+    )
+
+    value_high = (
+        high_pe
+        * float(
+            current_ttm_eps
+        )
+    )
+
+    text = (
+        f"{format_compact_valuation_price(value_low)}"
+        f"-"
+        f"{format_compact_valuation_price(value_high)}"
+        f"（中位"
+        f"{format_compact_valuation_price(value_mid)}"
+        f"）"
+    )
+
+    print(
+        f"{ticker}: PE 90D valuation={text}; "
+        f"PE mean={pe_mean:.4f}, "
+        f"SD(pop)={pe_sd:.4f}, "
+        f"coverage={coverage * 100:.1f}%"
+        + (
+            ", trailingEps bridge used."
+            if bridge_added
+            else "."
+        )
+    )
+
+    return {
+        "text": text,
+        "pe_mean": pe_mean,
+        "pe_sd": pe_sd,
+        "value_low": value_low,
+        "value_mid": value_mid,
+        "value_high": value_high,
+        "coverage": coverage,
+        "bridge_added": bridge_added,
+    }
+
+
 def choose_erp_eps(fundamental):
     """
     Choose the EPS basis used by Earnings Yield / ERP.
@@ -2287,7 +3466,8 @@ def fetch_yahoo_fundamental_snapshot(
     current_price,
 ):
     """
-    Fetch one ticker's TTM / NTM / +1Y EPS snapshot from Yahoo.
+    Fetch one ticker's TTM / NTM / +1Y EPS snapshot from Yahoo and calculate
+    the daily-cached PE(TTM) 90-calendar-day valuation.
 
     TTM EPS:
         trailingEps
@@ -2299,8 +3479,13 @@ def fetch_yahoo_fundamental_snapshot(
         fallback: Current Price / forwardPE
 
     NTM EPS:
-        calendarized from analyst rows 0y and +1y using the company's
-        upcoming fiscal year end.
+        normal: calendarized 0Y / +1Y using nextFiscalYearEnd
+        rollover pending: +1Y proxy
+        missing nextFiscalYearEnd: inferred-FYE calendarization
+
+    PE 90D Valuation:
+        point-in-time PE(TTM) over the most recent 90 CALENDAR days,
+        mean +/- one population SD, multiplied by current TTM EPS.
 
     ERP later chooses:
         NTM -> +1Y -> TTM
@@ -2318,6 +3503,8 @@ def fetch_yahoo_fundamental_snapshot(
         "ttm_eps": None,
         "ntm_eps": None,
         "plus1y_eps": None,
+        "pe_90d_valuation": None,
+        "ntm_mode": None,
     }
 
     if not ticker_erp_is_applicable(
@@ -2453,24 +3640,67 @@ def fetch_yahoo_fundamental_snapshot(
             )
 
     # -----------------------------------------------------
-    # NTM EPS calendarization
+    # NTM EPS with fiscal-year rollover protection
     # -----------------------------------------------------
 
-    fiscal_year_end = (
-        resolve_next_fiscal_year_end(
-            info
+    ntm_result = (
+        calculate_ntm_eps_with_rollover_protection(
+            current_fy_eps,
+            plus1y_eps,
+            info,
         )
     )
 
-    (
-        ntm_eps,
-        current_fy_weight,
-        plus1y_weight,
-    ) = calculate_calendarized_ntm_eps(
-        current_fy_eps,
-        plus1y_eps,
-        fiscal_year_end,
+    ntm_eps = ntm_result.get(
+        "ntm_eps"
     )
+
+    ntm_mode = ntm_result.get(
+        "mode"
+    )
+
+    # -----------------------------------------------------
+    # PE(TTM) 90-calendar-day tracking valuation
+    # -----------------------------------------------------
+
+    pe_90d_result = None
+
+    if (
+        ttm_eps is not None
+        and ttm_eps > 0
+    ):
+
+        try:
+            pe_90d_result = (
+                calculate_pe_90d_valuation(
+                    stock,
+                    ticker,
+                    ttm_eps,
+                )
+            )
+        except Exception as exc:
+
+            # PE90 failure should not destroy the otherwise-valid EPS/ERP
+            # refresh. Leave this field blank and retry at the next scheduled
+            # fundamental refresh.
+            print(
+                f"{ticker}: PE 90D calculation failed "
+                f"({exc})."
+            )
+
+            pe_90d_result = None
+
+    pe_90d_valuation = (
+        pe_90d_result.get(
+            "text"
+        )
+        if pe_90d_result
+        else None
+    )
+
+    # -----------------------------------------------------
+    # Logs
+    # -----------------------------------------------------
 
     if ttm_eps is not None:
 
@@ -2488,25 +3718,40 @@ def fetch_yahoo_fundamental_snapshot(
 
     if ntm_eps is not None:
 
-        print(
-            f"{ticker}: NTM EPS={ntm_eps:.4f} "
-            f"from 0Y={current_fy_eps:.4f}, "
-            f"+1Y={plus1y_eps:.4f}, "
-            f"FYE={fiscal_year_end}, "
-            f"weights={current_fy_weight:.3f}/"
-            f"{plus1y_weight:.3f}."
+        fiscal_year_end = ntm_result.get(
+            "fiscal_year_end"
         )
 
-    elif (
-        current_fy_eps is not None
-        and plus1y_eps is not None
-    ):
-
-        print(
-            f"{ticker}: 0Y/+1Y estimates exist but "
-            f"fiscal year end could not be resolved; "
-            f"NTM EPS unavailable."
+        current_fy_weight = ntm_result.get(
+            "current_fy_weight"
         )
+
+        plus1y_weight = ntm_result.get(
+            "plus1y_weight"
+        )
+
+        if (
+            current_fy_weight is not None
+            and plus1y_weight is not None
+            and current_fy_eps is not None
+        ):
+
+            print(
+                f"{ticker}: NTM EPS={ntm_eps:.4f} "
+                f"from 0Y={current_fy_eps:.4f}, "
+                f"+1Y={plus1y_eps:.4f}, "
+                f"FYE={fiscal_year_end}, "
+                f"weights={current_fy_weight:.3f}/"
+                f"{plus1y_weight:.3f}, "
+                f"mode={ntm_mode}."
+            )
+
+        else:
+
+            print(
+                f"{ticker}: NTM EPS={ntm_eps:.4f}, "
+                f"mode={ntm_mode}."
+            )
 
     if (
         ttm_eps is None
@@ -2529,8 +3774,9 @@ def fetch_yahoo_fundamental_snapshot(
         "ttm_eps": ttm_eps,
         "ntm_eps": ntm_eps,
         "plus1y_eps": plus1y_eps,
+        "pe_90d_valuation": pe_90d_valuation,
+        "ntm_mode": ntm_mode,
     }
-
 
 def prepare_fundamental_snapshots(
     ticker_info,
@@ -2569,6 +3815,10 @@ def prepare_fundamental_snapshots(
             "plus1y_eps"
         )
 
+        pe_90d_valuation = info.get(
+            "pe_90d_valuation"
+        )
+
         old_erp_eps_type = info.get(
             "erp_eps_type"
         )
@@ -2596,12 +3846,14 @@ def prepare_fundamental_snapshots(
             ttm_eps = None
             ntm_eps = None
             plus1y_eps = None
+            pe_90d_valuation = None
 
         snapshots[ticker] = {
             "applicable": applicable,
             "ttm_eps": ttm_eps,
             "ntm_eps": ntm_eps,
             "plus1y_eps": plus1y_eps,
+            "pe_90d_valuation": pe_90d_valuation,
             "updated_at": updated_at,
             "refreshed": False,
         }
@@ -2623,6 +3875,7 @@ def prepare_fundamental_snapshots(
                     "ttm_eps": None,
                     "ntm_eps": None,
                     "plus1y_eps": None,
+                    "pe_90d_valuation": None,
                     "updated_at": (
                         fundamental_now_iso()
                     ),
@@ -2714,6 +3967,12 @@ def prepare_fundamental_snapshots(
             "plus1y_eps": result.get(
                 "plus1y_eps"
             ),
+            "pe_90d_valuation": result.get(
+                "pe_90d_valuation"
+            ),
+            "ntm_mode": result.get(
+                "ntm_mode"
+            ),
             "updated_at": (
                 fundamental_now_iso()
             ),
@@ -2730,13 +3989,18 @@ def build_valuation_snapshot(
     ten_year_yield,
 ):
     """
-    Calculate Earnings Yield and ERP for one ticker.
+    Calculate current ERP plus NTM PEG for one ticker.
 
     ERP EPS basis priority:
         NTM -> +1Y -> TTM
 
-    Number values are decimal fractions:
-        0.0432 -> 4.32% in a Notion Percent field.
+    NTM PEG:
+        NTM PE = Current Price / NTM EPS
+        NTM Growth = NTM EPS / TTM EPS - 1
+        NTM PEG = NTM PE / (NTM Growth in percentage points)
+
+    NTM PEG is left blank when TTM/NTM EPS is non-positive or when projected
+    growth is <= 0, because a negative/zero-growth PEG is not useful here.
     """
 
     if not fundamental:
@@ -2796,6 +4060,63 @@ def build_valuation_snapshot(
         if not math.isfinite(erp):
             erp = None
 
+    ttm_eps = safe_finite_number(
+        fundamental.get(
+            "ttm_eps"
+        )
+    )
+
+    ntm_eps = safe_finite_number(
+        fundamental.get(
+            "ntm_eps"
+        )
+    )
+
+    ntm_pe = None
+    ntm_growth = None
+    ntm_peg = None
+
+    if (
+        ntm_eps is not None
+        and ntm_eps > 0
+    ):
+
+        ntm_pe = (
+            float(current_price)
+            / ntm_eps
+        )
+
+    if (
+        ttm_eps is not None
+        and ttm_eps > 0
+        and ntm_eps is not None
+    ):
+
+        ntm_growth = (
+            ntm_eps
+            / ttm_eps
+            - 1.0
+        )
+
+    if (
+        ntm_pe is not None
+        and ntm_growth is not None
+        and ntm_growth > 0
+    ):
+
+        ntm_peg = (
+            ntm_pe
+            / (
+                ntm_growth
+                * 100.0
+            )
+        )
+
+        if not math.isfinite(
+            ntm_peg
+        ):
+            ntm_peg = None
+
     return {
         "ticker": ticker,
         "eps": float(eps),
@@ -2809,6 +4130,12 @@ def build_valuation_snapshot(
         "plus1y_eps": fundamental.get(
             "plus1y_eps"
         ),
+        "pe_90d_valuation": fundamental.get(
+            "pe_90d_valuation"
+        ),
+        "ntm_pe": ntm_pe,
+        "ntm_growth": ntm_growth,
+        "ntm_peg": ntm_peg,
         "earnings_yield": (
             earnings_yield
         ),
@@ -2817,7 +4144,6 @@ def build_valuation_snapshot(
         ),
         "erp": erp,
     }
-
 
 def build_all_valuations(
     ticker_info,
@@ -2878,6 +4204,8 @@ def update_notion_price(
         TTM EPS
         NTM EPS
         +1Y EPS
+        PE 90D Valuation
+        NTM PEG
         ERP EPS Type
         Earnings Yield
         10Y Yield
@@ -3006,6 +4334,33 @@ def update_notion_price(
             )
         }
 
+        pe_90d_valuation = (
+            str(
+                fundamental.get(
+                    "pe_90d_valuation",
+                    "",
+                )
+                or ""
+            ).strip()
+        )
+
+        properties[
+            "PE 90D Valuation"
+        ] = {
+            "rich_text": (
+                [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": pe_90d_valuation
+                        },
+                    }
+                ]
+                if pe_90d_valuation
+                else []
+            )
+        }
+
         if updated_at:
 
             properties[
@@ -3039,8 +4394,14 @@ def update_notion_price(
                 "number": None
             }
 
+            properties[
+                "NTM PEG"
+            ] = {
+                "number": None
+            }
+
     # -----------------------------------------------------
-    # Current ERP basis / Earnings Yield / ERP
+    # Current ERP basis / Earnings Yield / ERP + NTM PEG
     # -----------------------------------------------------
 
     if valuation is not None:
@@ -3083,6 +4444,20 @@ def update_notion_price(
             )
         }
 
+        ntm_peg = valuation.get(
+            "ntm_peg"
+        )
+
+        properties[
+            "NTM PEG"
+        ] = {
+            "number": (
+                float(ntm_peg)
+                if ntm_peg is not None
+                else None
+            )
+        }
+
     elif fundamental is not None:
 
         # No usable price/EPS basis -> make sure old valuation values
@@ -3101,6 +4476,12 @@ def update_notion_price(
 
         properties[
             "ERP"
+        ] = {
+            "number": None
+        }
+
+        properties[
+            "NTM PEG"
         ] = {
             "number": None
         }
@@ -3174,10 +4555,21 @@ def update_notion_price(
             else "(no 10Y yield)"
         )
 
+        ntm_peg = valuation.get(
+            "ntm_peg"
+        )
+
+        ntm_peg_text = (
+            f"{ntm_peg:.4f}"
+            if ntm_peg is not None
+            else "N/A"
+        )
+
         print(
             f"{ticker}: Earnings Yield="
             f"{valuation['earnings_yield'] * 100:.2f}%, "
             f"ERP={erp_text}, "
+            f"NTM PEG={ntm_peg_text}, "
             f"source={valuation['eps_type']}"
         )
 
@@ -4181,6 +5573,7 @@ def add_missing_note_tickers_to_stock_price(
             "ttm_eps": None,
             "ntm_eps": None,
             "plus1y_eps": None,
+            "pe_90d_valuation": "",
             "erp_eps_type": None,
             "fundamental_updated": None,
             "ten_year_yield": None,
@@ -4824,6 +6217,54 @@ def build_daily_range_text(
         return ""
 
 
+def build_pe_peg_text(
+    valuation,
+):
+    """
+    Build the compact PE / PEG block shown in alert comments.
+
+    Example:
+
+        PE 90D估值：224-260（中位242）
+        NTM PEG：0.23
+
+    Missing values are omitted completely.
+    """
+
+    if not valuation:
+        return ""
+
+    lines = []
+
+    pe_90d_valuation = str(
+        valuation.get(
+            "pe_90d_valuation",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if pe_90d_valuation:
+        lines.append(
+            f"PE 90D估值：{pe_90d_valuation}"
+        )
+
+    ntm_peg = safe_finite_number(
+        valuation.get(
+            "ntm_peg"
+        )
+    )
+
+    if ntm_peg is not None:
+        lines.append(
+            f"NTM PEG：{ntm_peg:.2f}"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
 def build_erp_text(
     valuation,
 ):
@@ -4919,8 +6360,9 @@ def build_alert_message(
     Order:
         1. Price / alert-state change
         2. Daily High / Daily Low context
-        3. ERP context
-        4. Full alert-range list
+        3. PE 90D Valuation + NTM PEG
+        4. ERP context
+        5. Full alert-range list
     """
 
     price_text = (
@@ -5074,6 +6516,12 @@ def build_alert_message(
         )
     )
 
+    pe_peg_text = (
+        build_pe_peg_text(
+            valuation
+        )
+    )
+
     erp_text = (
         build_erp_text(
             valuation
@@ -5088,6 +6536,12 @@ def build_alert_message(
 
         message_parts.append(
             daily_range_text
+        )
+
+    if pe_peg_text:
+
+        message_parts.append(
+            pe_peg_text
         )
 
     if erp_text:
@@ -5865,6 +7319,13 @@ def main():
                 get_number_property(
                     page,
                     "+1Y EPS",
+                )
+            ),
+
+            "pe_90d_valuation": (
+                get_rich_text_property(
+                    page,
+                    "PE 90D Valuation",
                 )
             ),
 
