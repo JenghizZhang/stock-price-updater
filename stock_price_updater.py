@@ -4805,12 +4805,29 @@ def update_notion_price(
             or ""
         ).strip() or "N/A"
 
+        earnings_yield = valuation.get(
+            "earnings_yield"
+        )
+
+        earnings_yield_text = (
+            f"{earnings_yield * 100:.2f}%"
+            if earnings_yield is not None
+            else "N/A"
+        )
+
+        eps_type_text = (
+            valuation.get(
+                "eps_type"
+            )
+            or "N/A"
+        )
+
         print(
             f"{ticker}: Earnings Yield="
-            f"{valuation['earnings_yield'] * 100:.2f}%, "
+            f"{earnings_yield_text}, "
             f"ERP={erp_text}, "
             f"NTM PEG={ntm_peg_text}, "
-            f"source={valuation['eps_type']}"
+            f"source={eps_type_text}"
         )
 
 
