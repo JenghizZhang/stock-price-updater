@@ -119,6 +119,7 @@ TRADINGVIEW_HEADERS = {
 # when Yahoo's quarterly statement table is temporarily behind.
 #
 # NTM PEG = (Current Price / NTM EPS) / ((NTM EPS / TTM EPS - 1) * 100)
+# NTM PEG is stored as Rich text so unavailable cases can show a reason.
 #
 # ERP basis priority:
 #
@@ -2027,6 +2028,40 @@ def ticker_erp_is_applicable(ticker):
     )
 
 
+def pe_peg_inapplicable_reason(ticker, info):
+    """
+    Return a human-readable reason when company-style PE/PEG metrics should
+    not be calculated for this security.
+
+    ERP is intentionally handled separately; this helper only governs the
+    PE 90D Valuation and NTM PEG presentation.
+    """
+
+    ticker = str(ticker or "").upper().strip()
+
+    quote_type = str(
+        (info or {}).get(
+            "quoteType",
+            "",
+        )
+        or ""
+    ).upper().strip()
+
+    if (
+        ticker.startswith("^")
+        or ticker in {"S5TW"}
+        or quote_type in {
+            "ETF",
+            "INDEX",
+            "MUTUALFUND",
+            "MONEYMARKET",
+        }
+    ):
+        return "不适用：ETF/指数"
+
+    return None
+
+
 def parse_yahoo_date(value):
     """
     Convert a Yahoo date-like value to a date.
@@ -3161,16 +3196,31 @@ def calculate_pe_90d_valuation(
     historical close. The final valuation band applies the historical PE mean
     +/- one POPULATION standard deviation to CURRENT TTM EPS.
 
-    Returns:
-        None when Yahoo cannot reconstruct a reliable company PE series.
-        Otherwise a dict containing the compact Notion text and diagnostics.
+    This function ALWAYS returns a dict with a human-readable ``text`` value.
+    When a reliable valuation cannot be reconstructed, ``text`` contains the
+    reason shown directly in Notion, for example:
+
+        无估值：历史PE数据不全
+        无估值：历史存在负EPS
+        无估值：EPS数据口径异常
+        无估值：TTM EPS≤0
     """
 
-    if (
-        current_ttm_eps is None
-        or current_ttm_eps <= 0
-    ):
-        return None
+    current_ttm_eps = safe_finite_number(
+        current_ttm_eps
+    )
+
+    if current_ttm_eps is None:
+        return {
+            "text": "无估值：缺少TTM EPS",
+            "valid": False,
+        }
+
+    if current_ttm_eps <= 0:
+        return {
+            "text": "无估值：TTM EPS≤0",
+            "valid": False,
+        }
 
     (
         quarterly_eps,
@@ -3181,7 +3231,10 @@ def calculate_pe_90d_valuation(
     )
 
     if len(quarterly_eps) < 4:
-        return None
+        return {
+            "text": "无估值：历史PE数据不全",
+            "valid": False,
+        }
 
     earnings_events = (
         get_yahoo_earnings_event_records(
@@ -3197,11 +3250,11 @@ def calculate_pe_90d_valuation(
         )
     )
 
-    if (
-        not earnings_events
-        or not daily_prices
-    ):
-        return None
+    if not earnings_events or not daily_prices:
+        return {
+            "text": "无估值：历史PE数据不全",
+            "valid": False,
+        }
 
     mapped_quarters = (
         map_quarterly_eps_to_earnings_events(
@@ -3229,7 +3282,10 @@ def calculate_pe_90d_valuation(
     )
 
     if not states:
-        return None
+        return {
+            "text": "无估值：历史PE数据不全",
+            "valid": False,
+        }
 
     last_trade_date = daily_prices[-1][
         "trade_date"
@@ -3250,15 +3306,16 @@ def calculate_pe_90d_valuation(
         for item in daily_prices
         if (
             window_start
-            <= item[
-                "trade_date"
-            ]
+            <= item["trade_date"]
             <= last_trade_date
         )
     ]
 
     if not window_prices:
-        return None
+        return {
+            "text": "无估值：历史PE数据不全",
+            "valid": False,
+        }
 
     states = sorted(
         states,
@@ -3267,9 +3324,46 @@ def calculate_pe_90d_valuation(
         ],
     )
 
+    # -----------------------------------------------------
+    # Strong unit / accounting-basis sanity check.
+    #
+    # Some Yahoo securities (especially funds / ADR-like records) can expose
+    # quarterly EPS in a different unit/currency basis than info.trailingEps.
+    # An extreme mismatch is a clear signal to reject the series before any
+    # historical valuation is shown.
+    # -----------------------------------------------------
+
+    latest_state_eps = safe_finite_number(
+        states[-1].get(
+            "ttm_eps"
+        )
+    )
+
+    if (
+        not bridge_added
+        and latest_state_eps is not None
+        and latest_state_eps > 0
+        and current_ttm_eps > 0
+    ):
+        ratio = (
+            latest_state_eps
+            / current_ttm_eps
+        )
+
+        if ratio > 5.0 or ratio < 0.2:
+            print(
+                f"{ticker}: PE 90D rejected; "
+                f"EPS basis ratio={ratio:.4f}."
+            )
+            return {
+                "text": "无估值：EPS数据口径异常",
+                "valid": False,
+            }
+
     state_index = 0
     current_state = None
     valid_pe = []
+    negative_eps_in_window = False
 
     # Walk the entire available history so a state that became effective
     # before the 90-day window remains active inside the window.
@@ -3281,17 +3375,13 @@ def calculate_pe_90d_valuation(
 
         while (
             state_index < len(states)
-            and states[
-                state_index
-            ][
+            and states[state_index][
                 "effective_trade_date"
             ] <= trade_date
         ):
-
             current_state = states[
                 state_index
             ]
-
             state_index += 1
 
         if trade_date < window_start:
@@ -3313,6 +3403,12 @@ def calculate_pe_90d_valuation(
         )
 
         if (
+            historical_ttm is not None
+            and historical_ttm <= 0
+        ):
+            negative_eps_in_window = True
+
+        if (
             historical_ttm is None
             or historical_ttm <= 0
             or close is None
@@ -3322,13 +3418,8 @@ def calculate_pe_90d_valuation(
 
         pe = close / historical_ttm
 
-        if (
-            math.isfinite(pe)
-            and pe > 0
-        ):
-            valid_pe.append(
-                pe
-            )
+        if math.isfinite(pe) and pe > 0:
+            valid_pe.append(pe)
 
     coverage = (
         len(valid_pe)
@@ -3338,28 +3429,62 @@ def calculate_pe_90d_valuation(
         )
     )
 
-    if (
-        len(valid_pe) < 2
-        or coverage < 0.95
-    ):
+    if len(valid_pe) < 2 or coverage < 0.95:
+
+        reason = (
+            "无估值：历史存在负EPS"
+            if negative_eps_in_window
+            else "无估值：历史PE数据不全"
+        )
 
         print(
             f"{ticker}: PE 90D unavailable; "
-            f"coverage={coverage * 100:.1f}%."
+            f"coverage={coverage * 100:.1f}%, "
+            f"reason={reason}."
         )
 
-        return None
+        return {
+            "text": reason,
+            "valid": False,
+            "coverage": coverage,
+        }
 
-    pe_mean = (
-        sum(valid_pe)
-        / len(valid_pe)
-    )
+    # -----------------------------------------------------
+    # Final consistency check.
+    #
+    # If the reconstructed latest historical TTM EPS does not agree closely
+    # with current trailingEps, the history may be on a stale/different basis.
+    # MU-like fresh-report gaps are allowed only when the explicit bridge was
+    # added above.
+    # -----------------------------------------------------
+
+    if (
+        not bridge_added
+        and latest_state_eps is not None
+        and latest_state_eps > 0
+    ):
+        relative_difference = abs(
+            latest_state_eps
+            - current_ttm_eps
+        ) / current_ttm_eps
+
+        if relative_difference > 0.05:
+            print(
+                f"{ticker}: PE 90D rejected; latest reconstructed "
+                f"TTM differs from trailingEps by "
+                f"{relative_difference * 100:.1f}%."
+            )
+            return {
+                "text": "无估值：EPS数据口径异常",
+                "valid": False,
+                "coverage": coverage,
+            }
+
+    pe_mean = sum(valid_pe) / len(valid_pe)
 
     variance = (
         sum(
-            (
-                value - pe_mean
-            ) ** 2
+            (value - pe_mean) ** 2
             for value in valid_pe
         )
         / len(valid_pe)
@@ -3372,34 +3497,42 @@ def calculate_pe_90d_valuation(
     low_pe = pe_mean - pe_sd
     high_pe = pe_mean + pe_sd
 
-    if (
-        low_pe <= 0
-        or not math.isfinite(
-            high_pe
-        )
-    ):
-        return None
+    if low_pe <= 0 or not math.isfinite(high_pe):
+        return {
+            "text": "无估值：历史PE数据异常",
+            "valid": False,
+            "coverage": coverage,
+        }
 
     value_low = (
         low_pe
-        * float(
-            current_ttm_eps
-        )
+        * current_ttm_eps
     )
 
     value_mid = (
         pe_mean
-        * float(
-            current_ttm_eps
-        )
+        * current_ttm_eps
     )
 
     value_high = (
         high_pe
-        * float(
-            current_ttm_eps
-        )
+        * current_ttm_eps
     )
+
+    if not all(
+        math.isfinite(value)
+        and value > 0
+        for value in (
+            value_low,
+            value_mid,
+            value_high,
+        )
+    ):
+        return {
+            "text": "无估值：历史PE数据异常",
+            "valid": False,
+            "coverage": coverage,
+        }
 
     text = (
         f"{format_compact_valuation_price(value_low)}"
@@ -3424,6 +3557,7 @@ def calculate_pe_90d_valuation(
 
     return {
         "text": text,
+        "valid": True,
         "pe_mean": pe_mean,
         "pe_sd": pe_sd,
         "value_low": value_low,
@@ -3432,7 +3566,6 @@ def calculate_pe_90d_valuation(
         "coverage": coverage,
         "bridge_added": bridge_added,
     }
-
 
 def choose_erp_eps(fundamental):
     """
@@ -3504,6 +3637,7 @@ def fetch_yahoo_fundamental_snapshot(
         "ntm_eps": None,
         "plus1y_eps": None,
         "pe_90d_valuation": None,
+        "pe_peg_applicable": True,
         "ntm_mode": None,
     }
 
@@ -3519,6 +3653,8 @@ def fetch_yahoo_fundamental_snapshot(
         return {
             "status": "not_applicable",
             **empty_result,
+            "pe_90d_valuation": "不适用：ETF/指数",
+            "pe_peg_applicable": False,
         }
 
     try:
@@ -3546,6 +3682,15 @@ def fetch_yahoo_fundamental_snapshot(
             "status": "error",
             **empty_result,
         }
+
+    pe_peg_reason = pe_peg_inapplicable_reason(
+        ticker,
+        info,
+    )
+
+    pe_peg_applicable = (
+        pe_peg_reason is None
+    )
 
     # -----------------------------------------------------
     # TTM EPS
@@ -3663,13 +3808,10 @@ def fetch_yahoo_fundamental_snapshot(
     # PE(TTM) 90-calendar-day tracking valuation
     # -----------------------------------------------------
 
-    pe_90d_result = None
+    if not pe_peg_applicable:
+        pe_90d_valuation = pe_peg_reason
 
-    if (
-        ttm_eps is not None
-        and ttm_eps > 0
-    ):
-
+    else:
         try:
             pe_90d_result = (
                 calculate_pe_90d_valuation(
@@ -3678,25 +3820,28 @@ def fetch_yahoo_fundamental_snapshot(
                     ttm_eps,
                 )
             )
+
+            pe_90d_valuation = str(
+                pe_90d_result.get(
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
+
         except Exception as exc:
 
             # PE90 failure should not destroy the otherwise-valid EPS/ERP
-            # refresh. Leave this field blank and retry at the next scheduled
-            # fundamental refresh.
+            # refresh. The reason remains visible in Notion and the next
+            # scheduled fundamental refresh will retry.
             print(
                 f"{ticker}: PE 90D calculation failed "
                 f"({exc})."
             )
 
-            pe_90d_result = None
-
-    pe_90d_valuation = (
-        pe_90d_result.get(
-            "text"
-        )
-        if pe_90d_result
-        else None
-    )
+            pe_90d_valuation = (
+                "无估值：历史PE数据获取失败"
+            )
 
     # -----------------------------------------------------
     # Logs
@@ -3767,6 +3912,8 @@ def fetch_yahoo_fundamental_snapshot(
         return {
             "status": "no_data",
             **empty_result,
+            "pe_90d_valuation": pe_90d_valuation,
+            "pe_peg_applicable": pe_peg_applicable,
         }
 
     return {
@@ -3775,6 +3922,7 @@ def fetch_yahoo_fundamental_snapshot(
         "ntm_eps": ntm_eps,
         "plus1y_eps": plus1y_eps,
         "pe_90d_valuation": pe_90d_valuation,
+        "pe_peg_applicable": pe_peg_applicable,
         "ntm_mode": ntm_mode,
     }
 
@@ -3819,6 +3967,15 @@ def prepare_fundamental_snapshots(
             "pe_90d_valuation"
         )
 
+        pe_peg_applicable = (
+            not str(
+                pe_90d_valuation
+                or ""
+            ).startswith(
+                "不适用："
+            )
+        )
+
         old_erp_eps_type = info.get(
             "erp_eps_type"
         )
@@ -3854,6 +4011,7 @@ def prepare_fundamental_snapshots(
             "ntm_eps": ntm_eps,
             "plus1y_eps": plus1y_eps,
             "pe_90d_valuation": pe_90d_valuation,
+            "pe_peg_applicable": pe_peg_applicable,
             "updated_at": updated_at,
             "refreshed": False,
         }
@@ -3875,7 +4033,8 @@ def prepare_fundamental_snapshots(
                     "ttm_eps": None,
                     "ntm_eps": None,
                     "plus1y_eps": None,
-                    "pe_90d_valuation": None,
+                    "pe_90d_valuation": "不适用：ETF/指数",
+                    "pe_peg_applicable": False,
                     "updated_at": (
                         fundamental_now_iso()
                     ),
@@ -3890,9 +4049,17 @@ def prepare_fundamental_snapshots(
             and plus1y_eps is None
         )
 
+        pe_text_missing = (
+            not str(
+                pe_90d_valuation
+                or ""
+            ).strip()
+        )
+
         if (
             legacy_migration
             or no_cached_eps
+            or pe_text_missing
             or fundamental_refresh_due(
                 updated_at
             )
@@ -3970,6 +4137,10 @@ def prepare_fundamental_snapshots(
             "pe_90d_valuation": result.get(
                 "pe_90d_valuation"
             ),
+            "pe_peg_applicable": result.get(
+                "pe_peg_applicable",
+                True,
+            ),
             "ntm_mode": result.get(
                 "ntm_mode"
             ),
@@ -3994,71 +4165,17 @@ def build_valuation_snapshot(
     ERP EPS basis priority:
         NTM -> +1Y -> TTM
 
-    NTM PEG:
+    NTM PEG formula is intentionally unchanged:
         NTM PE = Current Price / NTM EPS
         NTM Growth = NTM EPS / TTM EPS - 1
         NTM PEG = NTM PE / (NTM Growth in percentage points)
 
-    NTM PEG is left blank when TTM/NTM EPS is non-positive or when projected
-    growth is <= 0, because a negative/zero-growth PEG is not useful here.
+    NTM PEG is written to Notion as Rich text so a missing value can explain
+    WHY it is unavailable instead of leaving a blank cell.
     """
 
     if not fundamental:
         return None
-
-    if not fundamental.get(
-        "applicable",
-        True,
-    ):
-        return None
-
-    (
-        eps,
-        eps_type,
-    ) = choose_erp_eps(
-        fundamental
-    )
-
-    if (
-        eps is None
-        or not eps_type
-        or current_price is None
-        or current_price <= 0
-    ):
-        return None
-
-    try:
-
-        earnings_yield = (
-            float(eps)
-            / float(current_price)
-        )
-
-    except (
-        TypeError,
-        ValueError,
-        ZeroDivisionError,
-    ):
-        return None
-
-    if not math.isfinite(
-        earnings_yield
-    ):
-        return None
-
-    erp = None
-
-    if ten_year_yield is not None:
-
-        erp = (
-            earnings_yield
-            - float(
-                ten_year_yield
-            )
-        )
-
-        if not math.isfinite(erp):
-            erp = None
 
     ttm_eps = safe_finite_number(
         fundamental.get(
@@ -4072,25 +4189,42 @@ def build_valuation_snapshot(
         )
     )
 
+    pe_peg_applicable = fundamental.get(
+        "pe_peg_applicable",
+        True,
+    )
+
     ntm_pe = None
     ntm_growth = None
     ntm_peg = None
 
-    if (
-        ntm_eps is not None
-        and ntm_eps > 0
-    ):
+    # -----------------------------------------------------
+    # NTM PEG human-readable result / reason
+    # -----------------------------------------------------
 
+    if not pe_peg_applicable:
+        ntm_peg_text = "不适用：ETF/指数"
+
+    elif current_price is None or current_price <= 0:
+        ntm_peg_text = "无PEG：缺少价格"
+
+    elif ttm_eps is None:
+        ntm_peg_text = "无PEG：缺少TTM EPS"
+
+    elif ttm_eps <= 0:
+        ntm_peg_text = "无PEG：TTM EPS≤0"
+
+    elif ntm_eps is None:
+        ntm_peg_text = "无PEG：缺少NTM EPS"
+
+    elif ntm_eps <= 0:
+        ntm_peg_text = "无PEG：NTM EPS≤0"
+
+    else:
         ntm_pe = (
             float(current_price)
             / ntm_eps
         )
-
-    if (
-        ttm_eps is not None
-        and ttm_eps > 0
-        and ntm_eps is not None
-    ):
 
         ntm_growth = (
             ntm_eps
@@ -4098,28 +4232,110 @@ def build_valuation_snapshot(
             - 1.0
         )
 
-    if (
-        ntm_pe is not None
-        and ntm_growth is not None
-        and ntm_growth > 0
-    ):
-
-        ntm_peg = (
-            ntm_pe
-            / (
-                ntm_growth
-                * 100.0
+        if ntm_growth <= 0:
+            ntm_peg_text = (
+                "无PEG：NTM盈利未增长"
             )
+
+        else:
+            ntm_peg = (
+                ntm_pe
+                / (
+                    ntm_growth
+                    * 100.0
+                )
+            )
+
+            if not math.isfinite(
+                ntm_peg
+            ):
+                ntm_peg = None
+                ntm_peg_text = (
+                    "无PEG：数据异常"
+                )
+
+            else:
+                # The user wants exactly two decimals in Notion / alerts.
+                ntm_peg_text = f"{ntm_peg:.2f}"
+
+                # A tiny TTM base can make the mathematically valid PEG look
+                # artificially attractive. Keep the formula unchanged, but
+                # surface that caveat directly beside the value.
+                if (
+                    ntm_eps > 0
+                    and ttm_eps / ntm_eps <= 0.10
+                ):
+                    ntm_peg_text += (
+                        "（TTM EPS基数低）"
+                    )
+
+    # -----------------------------------------------------
+    # ERP / Earnings Yield
+    # -----------------------------------------------------
+
+    earnings_yield = None
+    erp = None
+    eps = None
+    eps_type = None
+
+    if fundamental.get(
+        "applicable",
+        True,
+    ):
+        (
+            eps,
+            eps_type,
+        ) = choose_erp_eps(
+            fundamental
         )
 
-        if not math.isfinite(
-            ntm_peg
+        if (
+            eps is not None
+            and eps_type
+            and current_price is not None
+            and current_price > 0
         ):
-            ntm_peg = None
+            try:
+                earnings_yield = (
+                    float(eps)
+                    / float(current_price)
+                )
+            except (
+                TypeError,
+                ValueError,
+                ZeroDivisionError,
+            ):
+                earnings_yield = None
+
+            if (
+                earnings_yield is not None
+                and not math.isfinite(
+                    earnings_yield
+                )
+            ):
+                earnings_yield = None
+
+            if (
+                earnings_yield is not None
+                and ten_year_yield is not None
+            ):
+                erp = (
+                    earnings_yield
+                    - float(
+                        ten_year_yield
+                    )
+                )
+
+                if not math.isfinite(erp):
+                    erp = None
 
     return {
         "ticker": ticker,
-        "eps": float(eps),
+        "eps": (
+            float(eps)
+            if eps is not None
+            else None
+        ),
         "eps_type": eps_type,
         "ttm_eps": fundamental.get(
             "ttm_eps"
@@ -4136,12 +4352,9 @@ def build_valuation_snapshot(
         "ntm_pe": ntm_pe,
         "ntm_growth": ntm_growth,
         "ntm_peg": ntm_peg,
-        "earnings_yield": (
-            earnings_yield
-        ),
-        "ten_year_yield": (
-            ten_year_yield
-        ),
+        "ntm_peg_text": ntm_peg_text,
+        "earnings_yield": earnings_yield,
+        "ten_year_yield": ten_year_yield,
         "erp": erp,
     }
 
@@ -4397,7 +4610,14 @@ def update_notion_price(
             properties[
                 "NTM PEG"
             ] = {
-                "number": None
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": "不适用：ETF/指数"
+                        },
+                    }
+                ]
             }
 
     # -----------------------------------------------------
@@ -4408,6 +4628,10 @@ def update_notion_price(
 
         eps_type = valuation.get(
             "eps_type"
+        )
+
+        earnings_yield = valuation.get(
+            "earnings_yield"
         )
 
         properties[
@@ -4425,10 +4649,10 @@ def update_notion_price(
         properties[
             "Earnings Yield"
         ] = {
-            "number": float(
-                valuation[
-                    "earnings_yield"
-                ]
+            "number": (
+                float(earnings_yield)
+                if earnings_yield is not None
+                else None
             )
         }
 
@@ -4444,17 +4668,28 @@ def update_notion_price(
             )
         }
 
-        ntm_peg = valuation.get(
-            "ntm_peg"
-        )
+        ntm_peg_text = str(
+            valuation.get(
+                "ntm_peg_text",
+                "",
+            )
+            or ""
+        ).strip()
 
         properties[
             "NTM PEG"
         ] = {
-            "number": (
-                float(ntm_peg)
-                if ntm_peg is not None
-                else None
+            "rich_text": (
+                [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": ntm_peg_text
+                        },
+                    }
+                ]
+                if ntm_peg_text
+                else []
             )
         }
 
@@ -4483,7 +4718,14 @@ def update_notion_price(
         properties[
             "NTM PEG"
         ] = {
-            "number": None
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {
+                        "content": "无PEG：数据不足"
+                    },
+                }
+            ]
         }
 
     payload = {
@@ -4555,15 +4797,13 @@ def update_notion_price(
             else "(no 10Y yield)"
         )
 
-        ntm_peg = valuation.get(
-            "ntm_peg"
-        )
-
-        ntm_peg_text = (
-            f"{ntm_peg:.4f}"
-            if ntm_peg is not None
-            else "N/A"
-        )
+        ntm_peg_text = str(
+            valuation.get(
+                "ntm_peg_text",
+                "",
+            )
+            or ""
+        ).strip() or "N/A"
 
         print(
             f"{ticker}: Earnings Yield="
@@ -6223,12 +6463,15 @@ def build_pe_peg_text(
     """
     Build the compact PE / PEG block shown in alert comments.
 
-    Example:
+    The exact human-readable values/reasons used in Notion are reused here.
+
+    Examples:
 
         PE 90D估值：224-260（中位242）
         NTM PEG：0.23
 
-    Missing values are omitted completely.
+        PE 90D估值：无估值：历史存在负EPS
+        NTM PEG：无PEG：NTM盈利未增长
     """
 
     if not valuation:
@@ -6249,21 +6492,22 @@ def build_pe_peg_text(
             f"PE 90D估值：{pe_90d_valuation}"
         )
 
-    ntm_peg = safe_finite_number(
+    ntm_peg_text = str(
         valuation.get(
-            "ntm_peg"
+            "ntm_peg_text",
+            "",
         )
-    )
+        or ""
+    ).strip()
 
-    if ntm_peg is not None:
+    if ntm_peg_text:
         lines.append(
-            f"NTM PEG：{ntm_peg:.2f}"
+            f"NTM PEG：{ntm_peg_text}"
         )
 
     return "\n".join(
         lines
     )
-
 
 def build_erp_text(
     valuation,
